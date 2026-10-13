@@ -408,7 +408,8 @@
 - 规格：每台 4C x86-64-v3 / 8GB RAM / 40GB 盘（pool_1t）；OS Ubuntu 24.04（libc 2.39）
 - 运维：/etc/systemd/system/fdbmonitor.service（Type=simple，enable，重启自启已验证）；基础镜像源为 PVE 镜像
 - 状态：status 全绿，Replication Healthy，KV 读写冒烟通过
-- 注意：本环境为基准测试环境，非生产拓扑；40GB 盘仅够小数据集压测</div></div>
+- 注意：本环境为基准测试环境，非生产拓扑；40GB 盘仅够小数据集压测
+- 2026-10-13 RonDB 现状基线（实验室，REFERENCE）已建立：docs/fdb-feasibility-01-rondb-baseline.md —— 裸 ns_create ~0.12ms/7.9-8.8k ops/s（单线程）、remove ~0.43ms/2.2-2.5k ops/s、fused create+layout 1.1-1.4k ops/s（--no-cq）、16 线程 spread create 37.8k ops/s / shared 23.1k ops/s（热点父目录扩展墙）。对比锚点：同口径 FDB 提交 p50≈2.3ms（H-03），约 17x。启动清单第 13 项的生产工作负载画像部分仍待补。</div></div>
           </div>
         </div>
       </section>
