@@ -54,7 +54,9 @@
 ## 4. NFS 端到端（本轮）
 
 - 客户端挂载 `10.131.9.164:/` → `/pnfs` 成功，`ls /pnfs` 元数据读路径通过（metrics：getattr=10、readdir=1、access=1 无错误）。
-- **写回环（dd 8MB + md5 + 读回）未执行**：执行到审批门超时被拦，待下一次写批准时补跑。smoke 17 项端到端检查亦待补跑（scripts/pnfs-lab smoke 阶段）。
+- **写回环已验证**：8MB urandom `dd` 写入 + `sync` + 读回，两端 md5 一致（`311caf96...`），数据路径通。
+- 残留：8MB 探针文件 `/pnfs/baseline_probe` 清理（rm）被审批门拦，待下次写批准时一并清理。
+- **smoke 17 项端到端检查未执行**：脚本在客户端创建/删除测试目录（写操作），审批门超时被拦。待补跑 `scripts/pnfs-smoke.sh`（PNFS_MNT=/pnfs）。
 - 已发现残留问题：catalogue DS 注册表中存在遗留的 `bench-ds`（export 空、port 2049）条目，每次 MDS 启动会连续 6 次健康检查失败后标 OFFLINE（cooldown 30s flap）。不影响真实 DS（10.131.9.165:/export/ds 正常服务），但污染日志与 DS 健康计数——**清理该残留条目应列入 Phase 1 后续任务**。
 
 ## 5. 恢复事件记录（2026-10-13 01:45–01:58 UTC）
