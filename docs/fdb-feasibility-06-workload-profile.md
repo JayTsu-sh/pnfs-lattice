@@ -52,4 +52,13 @@
 
 - Phase 3 预验证：按 §1.2 三配方压测，FDB vs RonDB 同配方 A/B。
 - Phase 4 SLO 登记（计划 §01 "必须提前量化的验收线"）现在有参照系：SEQUENCE 热路径 P50 预算必须对 H-03 的 2.3ms 明确"接受/优化"；create 吞吐对标 8k 单线程 / 37.8k 16T-spread；remove 对标 2.3k。
-- conformance 回归集固定为 0007 那 17 项 + pynfs 179 用例（2 divergence 白名单）。
+- conformance 回归集固定为 0007 那 17 项 + pynfs 179 用例（2 divergence 白名单）——**注意 17 项的 RonDB 基线是 16/17（见 §4，server-side COPY 回归）**。
+
+## 4. smoke 17 项实验室基线（2026-10-13 实跑，`scripts/pnfs-smoke.sh`）
+
+**16 PASS / 1 FAIL**（两轮复现一致，含 ndbmtd 重启后一轮）：
+
+- core ops 10 项全过（mkdir/create+read/stat/chmod/rename/hardlink/symlink/truncate/readdir/remove）；data path 中 10MB 写+校验（drop_caches 后 md5）、10MB 删除、layout 宣告全过。
+- **FAIL：`cp+cat (small)`（server-side COPY/clone 路径）**——同挂载内 `cp` 19 字节文件，客户端 `cp: failed to clone ...: Input/output error`，dst 0 字节；**`dd` 同内容同路径 PASS**（排除普通写数据面故障）。MDS 日志同期：`layout chown failed ds=0 ... : -3` 刷屏 + `ds_gc blocked entry: ds_id not mounted here (dropping)`。代码路径：客户端 COPY → `compound_nfsv42.c` 同步 proxy → `mds_proxy_copy_data`（proxy_io.c:2322-2358，任一步失败→MDS_ERR_IO→NFS4ERR_IO）。
+- **定性：commit `1a7a753`（"re-enable server-side COPY/CLONE; fix four stacked COPY defects"）后的真实回归**，属 MDS 自身缺陷，与 FDB 替换无关；未建 JIRA（待确认 project）。
+- **对可行性分析的影响**：进入 D4 回归基线——Phase 4 A/B 对照前该 COPY 项需先修（否则 FDB 后端被扣同一个分），或从 17 项里单列"已知失败项"白名单并跟踪修复。
