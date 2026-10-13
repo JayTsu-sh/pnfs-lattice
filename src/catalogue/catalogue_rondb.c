@@ -666,6 +666,14 @@ enum mds_status catalogue_rondb_ns_create(
 	if (rc == 1) {
 		return MDS_ERR_EXISTS;
 	}
+	if (rc == -2) {
+		/* G2 fix (fdb-feasibility-02 A.3): transient NDB contention
+		 * (lock-wait timeouts) survived every retry.  Surface as DELAY
+		 * so the client backs off and resends the CREATE instead of
+		 * failing with a terminal EIO.  Same mapping as the ns_remove /
+		 * ns_create_wide paths (which already had it). */
+		return MDS_ERR_DELAY;
+	}
 	if (rc != 0) {
 		return MDS_ERR_IO;
 	}
@@ -3012,6 +3020,12 @@ enum mds_status catalogue_rondb_ns_create_with_layout(
 	rondb_transient_note_exhausted(rc);
 	if (rc == 1) {
 		return MDS_ERR_EXISTS;
+	}
+	if (rc == -2) {
+		/* G2 fix (fdb-feasibility-02 A.3): transient NDB contention
+		 * survived every retry -> DELAY, not terminal EIO (client
+		 * resends the create; layout is re-established on retry). */
+		return MDS_ERR_DELAY;
 	}
 	if (rc != 0) {
 		return MDS_ERR_IO;

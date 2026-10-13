@@ -8518,7 +8518,7 @@ int rondb_shim_ns_remove_gc(void *handle,
                              + rondb_retry_jitter_us()) * 1000L;
         nanosleep(&_ts, nullptr);
     }
-    return -2;  /* exhausted retries — signal MDS_ERR_BUSY to caller */
+    return -2;  /* exhausted retries -- C-wrapper maps -2 to MDS_ERR_DELAY (G2) */
 }
 
 int rondb_shim_ns_remove_full(void *handle,

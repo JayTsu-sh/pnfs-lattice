@@ -967,6 +967,14 @@ enum nfs4_status mds_status_to_nfs4(enum mds_status st)
 	case MDS_ERR_NOSPC:       return NFS4ERR_NOSPC;
 	case MDS_ERR_XDEV:        return NFS4ERR_XDEV;
 	case MDS_ERR_LAYOUTUNAVAIL: return NFS4ERR_LAYOUTUNAVAILABLE;
+	/* G1 fix (fdb-feasibility-02 A.3): NOSUPPORT previously fell through
+	 * to default -> NFS4ERR_SERVERFAULT.  NOSUPPORT means "this backend
+	 * has not implemented the operation" (unfilled auth_ops slot, e.g. a
+	 * partial FDB vertical slice); that is a stable server condition, not
+	 * a transient fault the client should retry.  Map it to the RFC 7530
+	 * NOTSUPP so the client stops retrying and the admin sees a clean
+	 * capability gap instead of an opaque serverfault. */
+	case MDS_ERR_NOSUPPORT:   return NFS4ERR_NOTSUPP;
 	/* NOLINTNEXTLINE(bugprone-branch-clone) */
 	case MDS_ERR_REPL:        return NFS4ERR_SERVERFAULT;
 	case MDS_ERR_NOSTANDBY:   return NFS4ERR_SERVERFAULT;

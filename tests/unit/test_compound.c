@@ -5474,10 +5474,36 @@ static void test_nametoolong_flag_paths(void)
 	close_test_db(db, path);
 }
 
+/* G1 regression: mds_status_to_nfs4 must map NOSUPPORT to the stable
+ * capability-gap NOTSUPP, not fall through default -> SERVERFAULT.
+ * Full-table coverage so the default branch can't silently absorb a
+ * new mds_status again. */
+static void test_mds_status_to_nfs4_mapping(void)
+{
+	/* The G1 fix itself. */
+	ASSERT_EQ(mds_status_to_nfs4(MDS_ERR_NOSUPPORT), NFS4ERR_NOTSUPP);
+
+	/* Spot-check the rest of the table stays stable (no drift). */
+	ASSERT_EQ(mds_status_to_nfs4(MDS_OK), NFS4_OK);
+	ASSERT_EQ(mds_status_to_nfs4(MDS_ERR_IO), NFS4ERR_IO);
+	ASSERT_EQ(mds_status_to_nfs4(MDS_ERR_NOTFOUND), NFS4ERR_NOENT);
+	ASSERT_EQ(mds_status_to_nfs4(MDS_ERR_EXISTS), NFS4ERR_EXIST);
+	ASSERT_EQ(mds_status_to_nfs4(MDS_ERR_DELAY), NFS4ERR_DELAY);
+	ASSERT_EQ(mds_status_to_nfs4(MDS_ERR_STALE), NFS4ERR_STALE);
+	ASSERT_EQ(mds_status_to_nfs4(MDS_ERR_NOSPC), NFS4ERR_NOSPC);
+	ASSERT_EQ(mds_status_to_nfs4(MDS_ERR_LAYOUTUNAVAIL),
+			NFS4ERR_LAYOUTUNAVAILABLE);
+	/* GATE: anything genuinely unknown still maps to SERVERFAULT
+	 * (the default), not to NOTSUPP/IO. */
+	ASSERT_EQ(mds_status_to_nfs4((enum mds_status)-999),
+			NFS4ERR_SERVERFAULT);
+}
+
 int main(void)
 {
 	fprintf(stdout, "Running compound dispatch tests:\n");
 
+	RUN_TEST(test_mds_status_to_nfs4_mapping);
 	RUN_TEST(test_root_getattr);
 	RUN_TEST(test_getattr_space_gated_on_bitmap);
 	RUN_TEST(test_layout_grant_range_policy);
