@@ -412,6 +412,7 @@
 - 2026-10-13 RonDB 现状基线（实验室，REFERENCE）已建立：docs/fdb-feasibility-01-rondb-baseline.md —— 裸 ns_create ~0.12ms/7.9-8.8k ops/s（单线程）、remove ~0.43ms/2.2-2.5k ops/s、fused create+layout 1.1-1.4k ops/s（--no-cq）、16 线程 spread create 37.8k ops/s / shared 23.1k ops/s（热点父目录扩展墙）。对比锚点：同口径 FDB 提交 p50≈2.3ms（H-03），约 17x。启动清单第 13 项的生产工作负载画像部分仍待补。
 - 2026-10-13 启动清单第 15 项（错误映射 + 有界重试规范）完成：docs/fdb-feasibility-02-error-retry-invariants.md §A —— 完整 grounded 的 mds_status→NFSv4 映射表（compound.c:950）+ 两层有界重试架构（shim 内层 NDB_RETRY_MAX=12 / 外层 RONDB_TRANSIENT_RETRIES=8）+ FDB 错误归一表；发现并登记两个真实缺陷 G1（MDS_ERR_NOSUPPORT 误映射 SERVERFAULT）、G2（重试耗尽→IO 终态而非 DELAY）。
 - 2026-10-13 启动清单第 17 项（评分权重/硬闸门/证据等级/争议裁决）：PROPOSAL 已提交，待决策方签署——docs/fdb-feasibility-03-scoring-decision-proposal.md（草案权重合计 100，正确性+一致性 38%；硬闸门 G-GATE-1..6；证据三档；争议裁决规则；决策点清单 §6）。签署前不勾 checkbox。
+- 2026-10-13 启动清单第 16 项（未知提交/部分失败/毒任务的幂等·对账·补偿测试设计）完成（spec 级，注入测试随 Phase 3 实现）：docs/fdb-feasibility-04-idempotency-reconciliation.md —— 复用现有 rename_2pc 启动 journal 扫描对账（R2PC_PREPARED in-doubt，rename_2pc.c:791/897）+ remove_pending TTL 租约 CAS claim（remove_manifest.c:978）+ bump_retry 有界重试；FDB 侧 unknown-commit 三分对账（绝不盲目重试 1021）、部分失败由单 FDB 事务保证数据原子性 + 事务外副作用走 2PC 兜底、毒任务 dead-letter 隔离；9 个注入测试 spec。
 - 2026-10-13 启动清单第 14 项部分完成：docs/fdb-feasibility-02-error-retry-invariants.md §B —— 跨后端不变量清单 I-1..I-9（grounded）+ 校验器 spec（validate_invariants，只读）+ 结果归档目录规范（manifest.json 约定）。校验器**实现**随 Phase 3 FDB 后端落地（仓库现无 FDB 代码，无可测对象）。</div></div>
           </div>
         </div>
@@ -729,7 +730,7 @@
             <label class="check"><input type="checkbox"><span>提取 RonDB 现状基线及真实生产/实验室工作负载画像</span></label>
             <label class="check"><input type="checkbox"><span>建立跨后端不变量校验器和结果归档目录</span></label>
             <label class="check"><input type="checkbox" checked><span>建立数据库错误 → mds_status → NFSv4 错误码的映射与有界重试规范</span></label>
-            <label class="check"><input type="checkbox"><span>为未知提交结果、部分失败和后台毒任务设计幂等、对账与补偿测试</span></label>
+            <label class="check"><input type="checkbox" checked><span>为未知提交结果、部分失败和后台毒任务设计幂等、对账与补偿测试</span></label>
             <label class="check"><input type="checkbox"><span>冻结评分权重、硬闸门、证据等级和争议裁决规则</span></label>
             <label class="check"><input type="checkbox"><span>先评审 keyspace 与事务设计，再批准候选实现及真实环境验证</span></label>
             <label class="check"><input type="checkbox"><span>把真实环境的迁移与回滚彩排纳入验证完成定义，而非上线后补做</span></label>
