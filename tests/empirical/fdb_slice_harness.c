@@ -31,6 +31,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include "mds_catalogue.h"
 #include "catalogue_internal.h"
@@ -113,6 +114,42 @@ static int names_sorted(const struct dir_result *r, int n)
 		if (strcmp(r->names[i-1], r->names[i]) >= 0)
 			return 0;
 	return 1;
+}
+
+/* ---- S-11 concurrency test context (file scope: the worker must
+ * not be a nested function) ---- */
+struct s11_ctx {
+	int tid;
+	struct mds_catalogue *cat;
+	struct mds_cat_txn txn;
+	uint64_t parent;
+	enum mds_status st;
+	uint64_t fids[25];
+};
+static struct s11_ctx s11[4];
+
+static void *s11_worker(void *arg)
+{
+	struct s11_ctx *c = arg;
+	int i;
+	char nm[32];
+
+	c->st = MDS_OK;
+	for (i = 0; i < 25; i++) {
+		enum mds_status s2;
+		struct mds_inode out2;
+
+		snprintf(nm, sizeof(nm), "c%d_%02d", c->tid, i);
+		s2 = c->cat->auth_ops->ns_create(c->cat, &c->txn, c->parent,
+						 nm, MDS_FTYPE_REG, 0644,
+						 0, 0, NULL, &out2);
+		if (s2 != MDS_OK) {
+			c->st = s2;
+			break;
+		}
+		c->fids[i] = out2.fileid;
+	}
+	return NULL;
 }
 
 int main(int argc, char **argv)
@@ -325,8 +362,106 @@ int main(int argc, char **argv)
 			      "S-10c subdir survives reopen (st=%s)",
 			      stname(st));
 		}
-		cat->ops->close(cat);
+		/* Leave the catalogue open: S-11 runs on it and the
+		 * final close happens at the end of main. */
 	}
+
+	/* S-11: concurrent creates on ONE hot parent (4 threads x 25,
+	 * distinct names).  Validates the atomic_op hot path:
+	 * - FID claims are atomic ADD batches -> every fid unique
+	 * - parent NL/CHG full-width atomic ADDs -> exact delta, no
+	 *   lost updates (the 370 ops/s RMW wall would show as lost
+	 *   counter increments or DELAY storms at this scale)
+	 * - per-name dirent keys never collide -> 0 conflict retries
+	 */
+	{
+		struct dir_result r;
+		uint64_t dir2_fid = 0;
+		pthread_t th[4];
+		int t, all_ok = 1;
+		int dup = 0;
+		uint64_t seen[256];
+		int nseen = 0;
+
+		if (cat == NULL) {
+			printf("  SKIP S-11 (catalogue not open)\n");
+			goto s11_done;
+		}
+		st = cat->auth_ops->ns_create(cat, &txn, 2, "slice_hotdir",
+					      MDS_FTYPE_DIR, 0755, 0, 0,
+					      NULL, &child);
+		CHECK(st == MDS_OK, "S-11.0 hotdir create (st=%s)", stname(st));
+		if (st == MDS_OK)
+			dir2_fid = child.fileid;
+
+		if (dir2_fid) {
+			struct mds_inode before, after;
+
+			memset(&before, 0, sizeof(before));
+			cat->auth_ops->ns_getattr(cat, dir2_fid, &before);
+
+			for (t = 0; t < 4; t++) {
+				s11[t].tid = t;
+				s11[t].cat = cat;
+				s11[t].txn = txn;
+				s11[t].parent = dir2_fid;
+				s11[t].st = MDS_OK;
+				memset(s11[t].fids, 0, sizeof(s11[t].fids));
+				pthread_create(&th[t], NULL, s11_worker,
+						&s11[t]);
+			}
+			for (t = 0; t < 4; t++)
+				pthread_join(th[t], NULL);
+
+			for (t = 0; t < 4; t++) {
+				int i;
+				int nfilled = 0;
+				if (s11[t].st != MDS_OK) {
+					all_ok = 0;
+					printf("  (S-11 t%d st=%s)\n", t,
+					       stname(s11[t].st));
+				}
+				for (i = 0; i < 25; i++) {
+					uint64_t f = s11[t].fids[i];
+					int j;
+					if (f == 0) continue;
+					nfilled++;
+					for (j = 0; j < nseen; j++)
+						if (seen[j] == f)
+							dup++;
+					seen[nseen++] = f;
+				}
+				printf("  (S-11 t%d: filled=%d first=%llu last=%llu)\n",
+				       t, nfilled,
+				       (unsigned long long)(nfilled ?
+					       s11[t].fids[0] : 0),
+				       (unsigned long long)(nfilled ?
+					       s11[t].fids[nfilled-1] : 0));
+			}
+			CHECK(all_ok && dup == 0 && nseen == 100,
+			      "S-11a 4x25 concurrent creates: ok=%d unique=%d dup=%d",
+			      all_ok, nseen, dup);
+
+			memset(&after, 0, sizeof(after));
+			st = cat->auth_ops->ns_getattr(cat, dir2_fid, &after);
+			CHECK(st == MDS_OK && after.change == before.change + 100,
+			      "S-11b parent CHG exact: %llu -> %llu (want +100)",
+			      (unsigned long long)before.change,
+			      (unsigned long long)after.change);
+
+			memset(&r, 0, sizeof(r));
+			st = cat->auth_ops->ns_readdir(cat, dir2_fid, NULL,
+						       256, &txn, dir_cb, &r);
+			CHECK(st == MDS_OK && r.count == 100,
+			      "S-11c readdir hotdir: count=%d (want 100, st=%s)",
+			      r.count, stname(st));
+		}
+	}
+
+	/* final close (catalogue left open through S-11) */
+s11_done:
+	if (cat != NULL)
+		cat->ops->close(cat);
 
 	printf("\n== result: %d passed, %d failed ==\n", g_pass, g_fail);
 	(void)rc;

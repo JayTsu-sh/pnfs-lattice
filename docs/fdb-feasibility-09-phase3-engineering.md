@@ -114,19 +114,79 @@ begin = (0,1) FIRST_GREATER_OR_EQUAL，end = (0,1) FIRST_GREATER_OR_EQUAL
 range 类 API 必须配一个"键值已知的小范围黄金用例"做黄金断言
 （本次 fdbcli getrange 对照 + raw_range_test 黄金用例即此用途）。
 
-## 5. 与 K 指标的对应
+## 5. atomic_op 热路径（Phase 3 第 2 步，2026-10-14 完成并实测）
 
-切片 23/23 全绿后无环境阻塞：K-1（create 吞吐）/ K-2（lookup）等
-单键类指标可直接采样；readdir 类指标（依赖 range 扫描）在 B-1 根因
+按 -05 §2.2/§2.3 落地了两件事，均在 node 44 真实集群验证：
+
+1. **FID 全局计数器 ADD 批认领**（H-01 生产化）：从 create 事务内的
+   普通 RMW 改为**事务外** atomic ADD 批认领 + 线程本地 1024 批池
+   （对齐 catalogue_rondb.c:431-471 的 per-thread pool 模型）。
+   FID 键彻底退出 create 事务写集——create 的冲突范围收敛到
+   dirent/inode/父计数器键本身。批认领的"ADD 后同事务回读"会因
+   读集重叠互相冲突，属 BENIGN（事务整体回滚、无双重认领），
+   走标准 on_error 退避重试（50 上限→DELAY，G2 路径）。
+2. **0x21 dirents_child 二级索引**（-05 §2.2 双向写）：
+   create 双写 `0x21|parent(8)|child_fileid(8) -> name(NUL)`，
+   remove 双清；wipe 扩到 0x21 段。承载 FDB 无原生索引的
+   child-ordered 有序性（READDIR-by-fid / name-reuse 探测）。
+
+### 5.1 本步揪出的两个真 bug（REAL，代码侧）
+
+**B-2：`fdb_txn_get` use-after-free（最重）**
+原实现在 `fdb_future_destroy(f)` **之后**才 `memcpy(buf, val, vlen)`——
+`fdb_future_get_value()` 返回的指针只在 future 销毁前有效，销毁后读
+的是客户端内部已释放/池化缓冲。纯读事务里窗口极短所以此前 23/23
+侥幸全绿；一旦事务内携带 mutation（批认领的 atomic ADD），缓冲复用
+确定性发生，回读稳定得到全零（诊断：`rc=8 buf=00 00 00 00 00 00 00 00`）。
+症状链：newval=0 → fid 批基址 2^64-1023（负 fid）→ 并发下 4 线程
+拿到同一负窗口。修复：先 memcpy 再 destroy。**教训：FDB C 的
+future 值指针生命周期 = future 生命周期，所有 get_* 取值必须
+在 destroy 前拷出**（与 KEYSEL 教训同级，写进 skill）。
+
+**B-3：claim 批基址 clamp 的无符号比较 no-op**
+`base = newval - count + 1; if (base < 3) ...` —— newval 小于
+count 时 base 无符号回绕成巨大值，`base < 3` 恒假，clamp 失效
+（fid=-1023 直接流出）。修复：改比 newval 本身
+（`if (newval >= count + 2)`），另加空批守护。
+
+**取证方法**（值得复用）：① 最小探针 probe_claim.c（set→点读→
+tx 内 ADD+回读→提交→点读）证明集群/库/.so 全对；② 同机用
+fdbcli 直看 0x00 段真实值（CHG=101=FID 各批 ADD 均正确落库）
+证明后端写路径正确；③ 加 `FDB_CLAIM_DEBUG` 打印 rc+字节，
+一步钉死"值在 destroy 后才被读"。三层隔离（探针 vs fdbcli vs
+带诊断源码）排除了全部环境嫌疑。
+
+### 5.2 并发验证 S-11（harness 新增，REAL 测量）
+
+4 线程 × 25 同父并发 create：fid 四批窗口互不重叠
+（1027-2050 / 2051-3074 / 3075-4098 / 4099-5122）、100/100 唯一
+零重复、父 CHG 精确 1→101（100 次 committed ADD 无丢失）、
+readdir=100。**harness 27/27 两轮全绿**（node 44，系统头编译）。
+这是 K-1 热点目录压测的功能侧前置：atomic 父计数器 + ADD 批
+FID 在并发下无丢失更新、无冲突丢失。
+
+### 5.3 回归
+
+本地 ENABLE_FDB=OFF ctest 全过（test_compound 在全量并发跑中偶发
+glibc malloc abort，单跑稳定通过，与本步改动无关——本步仅触及
+ENABLE_FDB=ON 才编译的 catalogue_fdb.c + 不在 ctest 里的 harness）。
+
+## 6. 与 K 指标的对应
+
+切片 23/23 + 热路径 27/27 全绿后无环境阻塞：K-1（create 吞吐）
+可直接压测（S-11 已证功能侧无丢失更新）；K-2（lookup）等单键类
+指标可直接采样；readdir 类指标（依赖 range 扫描）在 B-1 根因
 （KEYSEL 误用）修复后同样可测；K-4（rename，未实现）仍待后续槽位。
 
-## 6. 待办
+## 7. 待办
 
 - [x] B-1 已解决（§4.3）：根因是 KeySelector 编码误用（begin=(1,0)
       应为 (0,1)），非集群异常；fdbcli 对照 + 黄金用例证实，23/23 全绿
 - [x] S-5 复绿：23/23 两轮一致（node 44 真实集群）
-- [ ] 提交 slice 收尾 + 更新 -08 报告的 Phase 3 章节
-- [ ] atomic_op 热路径（FID 计数器 ADD 化 + 0x21 二级索引）
+- [x] atomic_op 热路径（§5）：FID ADD 批认领 + 0x21 二级索引，
+      揪出 B-2（use-after-free）/ B-3（clamp 无符号 no-op）两个
+      真 bug，27/27 两轮全绿（含 S-11 并发）
+- [ ] 提交热路径收尾 + 更新 -08 报告的 Phase 3 章节
 - [ ] validate_invariants I-1..I-9
 - [ ] 9 注入测试
 - [ ] K-1..K-9 实测

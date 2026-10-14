@@ -16,6 +16,10 @@
  *   0x10  inodes           key = 0x10 | fileid(8)  value = 285B wire
  *   0x20  dirents          key = 0x20 | parent(8) | name(NUL)
  *                          value = fileid(8,BE) | type(1)
+ *   0x21  dirents_child    key = 0x21 | parent(8) | child_fileid(8)
+ *                          value = name(NUL)  (secondary index, -05 §2.2:
+ *                          READDIR-by-fid + name-reuse detection; dual-write
+ *                          on create, dual-clear on remove)
  *
  * Design decisions carried over from the paper analysis (-05):
  *   - A directory's nlink and change live in INDEPENDENT full-width
@@ -138,24 +142,35 @@ static FDBTransaction *fdb_begin(FDBDatabase *db)
 }
 
 /* read one key; returns value length (>0) if present, 0 if absent,
- * -1 on FDB error.  buf receives min(vlen, bufsz) bytes. */
+ * -1 on FDB error.  buf receives min(vlen, bufsz) bytes.
+ *
+ * API contract: the value pointer from fdb_future_get_value() is
+ * only valid until the future is destroyed -- copy it out FIRST.
+ * (Copying after destroy reads client-internal freed/pooled
+ * memory; it is a latent use-after-free that deterministically
+ * clobbers values in transactions that also carry mutations.) */
 static int fdb_txn_get(FDBTransaction *tr, const uint8_t *key,
 		       uint32_t klen, uint8_t *buf, uint32_t bufsz)
 {
 	FDBFuture *f = fdb_transaction_get(tr, key, (int)klen, 0);
 	fdb_future_block_until_ready(f);
 	fdb_error_t err = fdb_future_get_error(f);
-	if (err) { fdb_future_destroy(f); return -1; }
-	fdb_bool_t present = 0;
-	const uint8_t *val = NULL;
-	int vlen = 0;
-	err = fdb_future_get_value(f, &present, &val, &vlen);
+	int rc = -1;
+	if (!err) {
+		fdb_bool_t present = 0;
+		const uint8_t *val = NULL;
+		int vlen = 0;
+		if (fdb_future_get_value(f, &present, &val, &vlen) == 0 &&
+		    present && val != NULL && vlen > 0) {
+			if ((uint32_t)vlen <= bufsz)
+				memcpy(buf, val, (size_t)vlen);
+			rc = vlen;
+		} else {
+			rc = 0;
+		}
+	}
 	fdb_future_destroy(f);
-	if (err) return -1;
-	if (!present || val == NULL || vlen <= 0) return 0;
-	if ((uint32_t)vlen <= bufsz)
-		memcpy(buf, val, (size_t)vlen);
-	return vlen;
+	return rc;
 }
 
 static fdb_error_t fdb_txn_commit_block(FDBTransaction *tr)
@@ -294,23 +309,102 @@ static enum mds_status fdb_ns_lookup(struct mds_catalogue *cat,
  * ns_create
  * ----------------------------------------------------------------------- */
 
-/* NOTE: the slice's fileid counter bump is a plain RMW -- the
- * production path must use fdb_transaction_atomic_op(ADD) on the FID
- * key (the atomic_op hot-path task tracks this).  At slice scale the
- * counter is cold enough; the hot PARENT counters (NL/CHG) are atomic
- * below. */
-static enum mds_status fdb_alloc_fileid(FDBTransaction *tr, uint64_t *out)
-{
-	uint8_t buf[8];
-	uint64_t fid;
-	int rc;
+/* NOTE: the global FID counter is claimed OUTSIDE the create
+ * transaction as an atomic ADD batch (H-01, mirrors the RonDB
+ * per-thread 1024-batch pool in catalogue_rondb.c:431-471):
+ * one small claim transaction (1 atomic op) per ~1024 creates
+ * per thread, and the FID key never appears in any create tx's
+ * write set -- the create tx's conflict range is exactly its own
+ * dirent/inode/counter keys.  Plain in-transaction RMW was the
+ * 370 ops/s wall measured in fdb-feasibility-01. */
+static _Thread_local uint64_t tl_fid_base      = 0;
+static _Thread_local uint32_t tl_fid_remaining = 0;
 
-	rc = fdb_txn_get(tr, CNT_FID_KEY, CNT_FID_LEN, buf, sizeof(buf));
-	if (rc < 0) return MDS_ERR_IO;
-	fid = (rc > 0) ? (fdb_get_u64_le(buf) + 1) : 1;
-	fdb_put_u64_le(buf, fid);
-	fdb_transaction_set(tr, CNT_FID_KEY, CNT_FID_LEN, buf, 8);
-	*out = fid;
+/* Claim a batch of fileids from the global counter: atomic ADD of
+ * MDS_FILEID_BATCH on the FID key, read back the new counter value
+ * (the mutation is visible in-transaction), commit.  Returns
+ * [base, base+count) via out_base/out_count.  The counter is the
+ * last-issued id, so the batch is (new-value - count, new-value].
+ * The counter is seeded at 2 by fdb_ensure_root (0/1 reserved,
+ * 2 = root); if it was ever missing, ADD treats it as 0 and the
+ * clamping below skips the reserved ids.
+ *
+ * The read-back is read-your-writes (it must include this tx's own
+ * ADD), so the FID key lands in the read set and concurrent claims
+ * conflict with each other on it.  That conflict is BENIGN: a
+ * conflicted tx commits nothing (no double-claim), and the retry
+ * re-carves a fresh batch.  Claims are rare (one per 1024 creates
+ * per thread), so this never touches the hot create path. */
+static enum mds_status fdb_claim_fileids(FDBDatabase *db,
+						   uint64_t *out_base,
+						   uint32_t *out_count)
+{
+	uint8_t op[8];
+	uint64_t newval = 0, base;
+	uint32_t count = MDS_FILEID_BATCH;
+	uint32_t attempt;
+
+	fdb_put_u64_le(op, count);
+
+	for (attempt = 0; attempt <= FDB_RETRY_MAX; attempt++) {
+		FDBTransaction *tr = fdb_begin(db);
+		fdb_error_t err;
+		int rc;
+		uint8_t buf[8];
+
+		memset(buf, 0, sizeof(buf));
+		fdb_transaction_atomic_op(tr, CNT_FID_KEY, CNT_FID_LEN, op, 8,
+					  FDB_MUTATION_TYPE_ADD);
+		rc = fdb_txn_get(tr, CNT_FID_KEY, CNT_FID_LEN, buf,
+				 sizeof(buf));
+		if (rc < 0) {
+			fdb_transaction_destroy(tr);
+			return MDS_ERR_IO;
+		}
+		newval = fdb_get_u64_le(buf);
+		err = fdb_txn_commit_block(tr);
+		if (err == 0) {
+			fdb_transaction_destroy(tr);
+			break;
+		}
+		/* Conflicted on the counter read: nothing committed,
+		 * apply the recommended backoff, then re-claim. */
+		fdb_conflict_backoff(tr, err);
+		fdb_transaction_destroy(tr);
+		if (attempt == FDB_RETRY_MAX)
+			return MDS_ERR_DELAY;
+	}
+
+	/* Map the committed counter (newval = last-issued id) to the
+	 * claimed batch (newval-count+1 .. newval], clamping the
+	 * reserved ids 0/1/2.  NB: the clamp must compare NEWVAL, not
+	 * the wrapped base -- uint64 underflow makes base a huge
+	 * value for which `base < 3` is never true. */
+	if (newval >= (uint64_t)count + 2) {
+		base = newval - count + 1;
+	} else {
+		base = 3;
+		count = (newval >= 2) ? (uint32_t)(newval - 2) : 0;
+	}
+	*out_base = base;
+	*out_count = count;
+	return MDS_OK;
+}
+
+/* Next fileid from this thread's batch pool; refills transparently. */
+static enum mds_status fdb_alloc_fileid(FDBDatabase *db, uint64_t *out)
+{
+	if (tl_fid_remaining == 0) {
+		enum mds_status st = fdb_claim_fileids(db, &tl_fid_base,
+						       &tl_fid_remaining);
+		if (st != MDS_OK)
+			return st;
+		if (tl_fid_remaining == 0)
+			return MDS_ERR_IO; /* empty claim: nothing to give */
+	}
+	*out = tl_fid_base;
+	tl_fid_base++;
+	tl_fid_remaining--;
 	return MDS_OK;
 }
 
@@ -360,20 +454,23 @@ static enum mds_status fdb_ns_create(struct mds_catalogue *cat,
 
 	clock_gettime(CLOCK_REALTIME, &now);
 
+	/* FID claim happens OUTSIDE the retry loop: the thread's batch
+	 * pool hands out ids without touching FDB, and a retried
+	 * attempt reuses the same fid (the pre-check re-runs inside). */
+	if (fid == 0) {
+		enum mds_status st = fdb_alloc_fileid(s->db, &fid);
+		if (st != MDS_OK)
+			return st;
+	}
+
 	for (attempt = 0; attempt <= FDB_RETRY_MAX; attempt++) {
 		FDBTransaction *tr = fdb_begin(s->db);
 		fdb_error_t err;
 		uint8_t fbuf[8];
 		uint8_t pkey[9];
+		uint8_t ikey[17];
 		int rc;
 
-		if (fid == 0) {
-			enum mds_status st = fdb_alloc_fileid(tr, &fid);
-			if (st != MDS_OK) {
-				fdb_transaction_destroy(tr);
-				return st;
-			}
-		}
 		fdb_put_u64_be(fbuf, fid);
 
 		/* Existence pre-check (the insert itself is the
@@ -434,6 +531,16 @@ static enum mds_status fdb_ns_create(struct mds_catalogue *cat,
 		dval[8] = (uint8_t)type;
 		fdb_transaction_set(tr, dkey, 9 + (uint32_t)nlen + 1,
 				    dval, 9);
+
+		/* Secondary index 0x21 (dual-write, -05 §2.2):
+		 * 0x21 | parent(8) | child_fileid(8) -> name(NUL).
+		 * Carries the child-ordered ordering FDB cannot
+		 * index natively (READDIR-by-fid, name-reuse probe). */
+		ikey[0] = 0x21;
+		fdb_put_u64_be(ikey + 1, parent);
+		fdb_put_u64_be(ikey + 9, fid);
+		fdb_transaction_set(tr, ikey, 17,
+				    (const uint8_t *)name, nlen + 1);
 
 		err = fdb_txn_commit_block(tr);
 		if (err == 0) {
@@ -504,6 +611,14 @@ static enum mds_status fdb_ns_remove(struct mds_catalogue *cat,
 		rc = fdb_txn_get(tr, ikey, 9, ibuf, sizeof(ibuf));
 		if (rc <= 0) { fdb_transaction_destroy(tr);
 			       return (rc == 0) ? MDS_ERR_STALE : MDS_ERR_IO; }
+		/* Secondary index key for the child (dual-clear). */
+		{
+			uint8_t xkey[17];
+			xkey[0] = 0x21;
+			fdb_put_u64_be(xkey + 1, parent);
+			fdb_put_u64_be(xkey + 9, fid);
+			fdb_transaction_clear(tr, xkey, 17);
+		}
 		if (rondb_inode_deserialize(ibuf, RONDB_INODE_FIXED_SIZE,
 					    &child, NULL) != 0) {
 			fdb_transaction_destroy(tr);
@@ -862,6 +977,7 @@ enum mds_status catalogue_fdb_wipe(struct mds_catalogue *cat)
 	uint8_t b0[1] = {0x00}, e0[1] = {0x01};
 	uint8_t b1[1] = {0x10}, e1[1] = {0x11};
 	uint8_t b2[1] = {0x20}, e2[1] = {0x21};
+	uint8_t b3[1] = {0x21}, e3[1] = {0x22};
 	FDBTransaction *tr;
 	fdb_error_t e;
 
@@ -870,6 +986,7 @@ enum mds_status catalogue_fdb_wipe(struct mds_catalogue *cat)
 	fdb_transaction_clear_range(tr, b0, 1, e0, 1);
 	fdb_transaction_clear_range(tr, b1, 1, e1, 1);
 	fdb_transaction_clear_range(tr, b2, 1, e2, 1);
+	fdb_transaction_clear_range(tr, b3, 1, e3, 1);
 	e = fdb_txn_commit_block(tr);
 	fdb_transaction_destroy(tr);
 	if (e != 0) return MDS_ERR_IO;
