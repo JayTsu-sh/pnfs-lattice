@@ -678,8 +678,15 @@ static enum mds_status fdb_ns_readdir(struct mds_catalogue *cat,
 		int count = 0;
 		fdb_bool_t more = 0;
 
-		f = fdb_transaction_get_range(tr, begin, 9, 1, 0,
-					      end, 9, 0, 0,
+		/* Selectors per fdb_c.h KEYSEL macros (verified
+		 * empirically on the lab cluster):
+		 * begin = FIRST_GREATER_OR_EQUAL(0x20|parent)  -> (0,1)
+		 * end   = FIRST_GREATER_OR_EQUAL(0x20|parent+1) -> (0,1)
+		 * (exclusive end at the next parent's prefix).
+		 * NB: LAST_LESS_THAN (0,0) as end would silently drop
+		 * the last dirent of this parent. */
+		f = fdb_transaction_get_range(tr, begin, 9, 0, 1,
+					      end, 9, 0, 1,
 					      0, 0, FDB_STREAMING_MODE_WANT_ALL,
 					      0, 0, 0);
 		fdb_future_block_until_ready(f);
@@ -708,9 +715,12 @@ static enum mds_status fdb_ns_readdir(struct mds_catalogue *cat,
 				continue; /* malformed: skip defensively */
 			if (nlen == 1 && nm[0] == '.')
 				continue; /* '.'/'..' sentinels (not stored) */
+			/* name segment in the key is NUL-terminated, so nlen
+			 * includes the NUL; the cookie compares the name
+			 * WITHOUT it (nlen-1). */
 			if (start_after != NULL && start_after[0] != '\0' &&
-			    nlen == strlen(start_after) &&
-			    memcmp(nm, start_after, nlen) == 0)
+			    (nlen - 1) == strlen(start_after) &&
+			    memcmp(nm, start_after, nlen - 1) == 0)
 				continue; /* resume strictly after cookie */
 			memset(&entry, 0, sizeof(entry));
 			entry.fileid = fdb_get_u64_be(v);

@@ -50,7 +50,7 @@ FDB 集群（7.4.8, node 44-46）上跑通并验证 -05 键空间设计的不变
 
 ## 4. 结果（REAL）
 
-### 4.1 切片功能：21/23 通过
+### 4.1 切片功能：23/23 通过（2026-10-14 两轮复跑一致）
 
 | 断言 | 结果 | 说明 |
 |------|------|------|
@@ -58,7 +58,7 @@ FDB 集群（7.4.8, node 44-46）上跑通并验证 -05 键空间设计的不变
 | S-2 create dir + lookup/getattr 往返 | PASS | fid 从计数器分配 |
 | S-3 create file（父 nlink 不变, change+1, 原子 ADD） | PASS | |
 | S-4 重复 create → EXISTS | PASS | 原子预检 |
-| S-5a/S-5b readdir + 分页 | **FAIL** | 见 §5 range 异常 |
+| S-5a/S-5b readdir + 分页 | PASS | 修 KEYSEL 后全绿，见 §4.3 |
 | S-6 setattr 持久化（mode/size/uid/gid, change+1） | PASS | |
 | S-7 remove file（dirent 消失 + inode 键真删 + NOTFOUND） | PASS | |
 | S-8 remove dir → NOSUPPORT | PASS | G1 边界路径 |
@@ -80,59 +80,52 @@ FDB 集群（7.4.8, node 44-46）上跑通并验证 -05 键空间设计的不变
 6. **FID 计数器种子**：ensure_root 未播种计数器 → 前两次分配 fid=1/2
    撞 root 键；播种为 2（0/1 保留，2=root）
 
-### 4.3 FDB 集群 range 扫描异常（REAL，环境层，阻塞 S-5）
+### 4.3 B-1 已解决（2026-10-14 反转）：根因是 C API KEYSEL 编码误用，集群无异常
 
-**现象**（`fdb_raw_range_test.c`，零共享代码，系统头编译，node 44）：
+**初判（已被推翻）**：零共享代码 + 系统头编译的最小 range 测试复现
+"range 上下界整体左移一个键位"，一度登记为集群级异常。
 
+**反转证据**：同机同库同集群，fdbcli（独立二进制）`getrange` 对同样的
+键返回**完全正确**的结果（[A,B)={A01,A02} 等）→ 集群健康、库健康，
+问题在我的 C 调用。
+
+**根因（REAL，代码侧）**：`fdb_transaction_get_range` 的 KeySelector
+参数 (or_equal, offset) 语义按头文件 KEYSEL 宏：
+
+```c
+FDB_KEYSEL_LAST_LESS_OR_EQUAL(k, l)     = k, l, 1, 0
+FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(k, l) = k, l, 0, 1
 ```
-set: A01=de ad, A02=be ef, B03=11 22, B04=33 44   (commit err=0)
-point read B03 -> present, val=11 22                (正确)
-range [A,B) 期望 {A01,A02}
-  实际 {20 00...03 66 5f 31 00 (范围外的旧键!), 41 01}
-range [B,C) 期望 {B03,B04}
-  实际 {41 02 (低于下界!), 42 03}                    (漏 B04)
-```
 
-规律：**range 的上下界同时左移一个键位**——结果 = {prev(begin), begin}，
-精确地整体偏移一行。点读（get）全部正确；set/commit/点读/集群 status
-全部正常。
+readdir 的 begin 我写成了 (1,0) = LAST_LESS_OR_EQUAL —— 即"begin 的
+**前一个**键"（begin 本身不在 DB 时取全局前驱）。这精确解释了全部
+观测：[A,B) 返回 {X, A}（X = A 前一个全局键）、S-5a 返回 slice_subdir
+（0x20|3 前缀的全局前驱）、reverse 同样偏移、边界键不存在时
+or_equal 0/1 无差别。第二层同样错误：end 用 (0,0) 排他会把该 parent
+**最后一个** dirent 静默丢弃（S-5a count=1 少一个）。第三层：cookie
+skip 比较 NUL 计长不一致（key 的 name 段含 NUL，strlen 不含）。
 
-**已排除**：
-- 业务代码：零共享代码的最小测试复现（raw_range_test.c 不链接
-  catalogue_fdb.c 的任何代码）
-- 头文件 ABI 错配：用 44 系统 /usr/include/foundationdb 头重编，结果相同
-- 版本错配：client 7.4.8 == server 7.4.8
-- 配置：foundationdb.conf 无自定义 knob（默认配置）
-- 数据新鲜度：range 返回的键值正是本进程刚 set 的值（同一 DB）
+**修复**（catalogue_fdb.c ns_readdir，已在集群上验证）：
+begin = (0,1) FIRST_GREATER_OR_EQUAL，end = (0,1) FIRST_GREATER_OR_EQUAL
+(next parent prefix)，cookie skip 用 nlen-1。修复后 **23/23 两轮全绿**。
 
-**未排除**：
-- 该集群的 server 端 range 扫描路径（TSS/日志层）存在 7.4.8 特有缺陷
-  或该部署的数据目录处于异常状态
-- 从 node 45/46 用不同客户端进程验证（45 无 gcc，44 中转 scp 被
-  审批门超时拦截，待批准后补做）
-
-**影响**：ns_readdir（以及任何依赖 range 扫描的路径：readdir、
-migration 批量读、future 的 0x21 二级索引）在该集群上不可信。
-单键路径（lookup/getattr/setattr/create/remove 的主键读）不受影响，
-S-1..S-4/S-6..S-10 的通过是有效的。
-
-**处置**：
-- 登记为 Phase 3 阻塞项 B-1；S-5 的失败判定为环境因素而非实现缺陷
-  （readdir 实现本身在 raw 探测层面已验证键构造正确）
-- 建议下一步：node 45/46 交叉验证 → 若同样异常则重装/重建该集群
-  数据目录，或升级 FDB 版本复测
-- 在 B-1 解除前，readdir 相关的 K-1..K-9 实测不可进行
+**教训**：FDB C 的 KeySelector 四个组合语义反直觉（or_equal 与 offset
+共同决定），调用时直接对照头文件 KEYSEL 宏编码，不要凭参数名猜；
+range 类 API 必须配一个"键值已知的小范围黄金用例"做黄金断言
+（本次 fdbcli getrange 对照 + raw_range_test 黄金用例即此用途）。
 
 ## 5. 与 K 指标的对应
 
-K-1（create 吞吐）/ K-2（lookup）等单键类指标可在现有 21/23 基础上
-先行采样；K-4（rename，未实现）与 readdir 类指标受 B-1 阻塞。
+切片 23/23 全绿后无环境阻塞：K-1（create 吞吐）/ K-2（lookup）等
+单键类指标可直接采样；readdir 类指标（依赖 range 扫描）在 B-1 根因
+（KEYSEL 误用）修复后同样可测；K-4（rename，未实现）仍待后续槽位。
 
 ## 6. 待办
 
-- [ ] B-1：node 45/46 交叉验证 range 异常（需 scp 中转审批）
-- [ ] B-1：若确认集群级 → 重建集群数据目录复测
-- [ ] S-5 复绿后提交 slice 收尾 + 更新 -08 报告的 Phase 3 章节
+- [x] B-1 已解决（§4.3）：根因是 KeySelector 编码误用（begin=(1,0)
+      应为 (0,1)），非集群异常；fdbcli 对照 + 黄金用例证实，23/23 全绿
+- [x] S-5 复绿：23/23 两轮一致（node 44 真实集群）
+- [ ] 提交 slice 收尾 + 更新 -08 报告的 Phase 3 章节
 - [ ] atomic_op 热路径（FID 计数器 ADD 化 + 0x21 二级索引）
 - [ ] validate_invariants I-1..I-9
 - [ ] 9 注入测试
