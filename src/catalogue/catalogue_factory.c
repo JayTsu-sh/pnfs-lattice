@@ -26,6 +26,12 @@ enum mds_status mds_catalogue_open(const struct mds_config *cfg,
 	}
 #endif
 
+#ifdef HAVE_FDB
+	if (cfg->catalogue_backend == MDS_BACKEND_FDB) {
+		return catalogue_fdb_open(cfg, out);
+	}
+#endif
+
 	MDS_LOG_ERROR(LOG_COMP_CAT,
 		"unsupported catalogue_backend %d",
 		(int)cfg->catalogue_backend);

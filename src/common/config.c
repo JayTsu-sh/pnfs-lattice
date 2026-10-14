@@ -483,10 +483,20 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
                 (void)fclose(fp);
                 return MDS_ERR_INVAL;
 #endif
+            } else if (strcmp(val, "fdb") == 0) {
+#ifdef HAVE_FDB
+                cfg->catalogue_backend = MDS_BACKEND_FDB;
+#else
+                (void)fprintf(stderr,
+                    "ERROR: catalogue_backend=fdb but "
+                    "binary built without ENABLE_FDB\n");
+                (void)fclose(fp);
+                return MDS_ERR_INVAL;
+#endif
             } else {
                 (void)fprintf(stderr,
                     "ERROR: unknown catalogue_backend '%s' "
-                    "(expected rondb)\n", val);
+                    "(expected rondb or fdb)\n", val);
                 (void)fclose(fp);
                 return MDS_ERR_INVAL;
             }

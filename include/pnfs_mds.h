@@ -527,6 +527,7 @@ enum mds_workload_profile {
 
 enum mds_catalogue_backend {
     MDS_BACKEND_RONDB   = 0,  /**< Production: RonDB / NDB Cluster (distributed). */
+    MDS_BACKEND_FDB     = 1,  /**< FoundationDB catalogue backend (phase 3 vertical slice). */
 };
 
 /* -----------------------------------------------------------------------

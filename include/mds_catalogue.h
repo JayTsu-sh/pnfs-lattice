@@ -935,6 +935,12 @@ enum mds_status mds_cat_subtree_iter(struct mds_catalogue *cat,
 enum mds_status catalogue_rondb_open(const struct mds_config *cfg,
 				     struct mds_catalogue **out);
 #endif
+#ifdef HAVE_FDB
+enum mds_status catalogue_fdb_open(const struct mds_config *cfg,
+				   struct mds_catalogue **out);
+/* Test-only: clear the slice keyspaces and re-seed root. */
+enum mds_status catalogue_fdb_wipe(struct mds_catalogue *cat);
+#endif
 
 /**
  * Wire a commit queue into the catalogue (non-owning).

@@ -93,6 +93,31 @@ if(ENABLE_RONDB)
     endif()
 endif()
 
+# FoundationDB catalogue backend (phase 3 vertical slice).  Default OFF;
+# requires FDB_INCLUDE_DIR / FDB_LIBRARY (set FDB_ROOT to the dir holding
+# include/foundationdb/ and libfdb_c.so, e.g. the lab node's /).
+if(ENABLE_FDB)
+    if(NOT DEFINED FDB_ROOT)
+        set(FDB_ROOT "/")
+    endif()
+    if(EXISTS "${FDB_ROOT}/include/foundationdb/fdb_c.h")
+        add_compile_definitions(HAVE_FDB=1)
+        target_sources(pnfs_mds_core PRIVATE
+            ${PROJECT_SOURCE_DIR}/src/catalogue/catalogue_fdb.c
+        )
+        target_include_directories(pnfs_mds_core SYSTEM PRIVATE
+            ${FDB_ROOT}/include
+        )
+        target_link_libraries(pnfs_mds_core PUBLIC
+            ${FDB_ROOT}/lib/libfdb_c.so pthread
+        )
+        message(STATUS "FoundationDB catalogue backend enabled (FDB_ROOT=${FDB_ROOT})")
+    else()
+        message(WARNING "FDB headers not found under ${FDB_ROOT} -- ENABLE_FDB disabled")
+        set(ENABLE_FDB OFF)
+    endif()
+endif()
+
 target_include_directories(pnfs_mds_core
     PUBLIC ${PROJECT_SOURCE_DIR}/include
     PRIVATE ${PROJECT_SOURCE_DIR}/src/catalogue
