@@ -158,16 +158,16 @@ FDB 与 NDB 的**根本差异**决定了 keyspace 设计的所有难点：
 
 ---
 
-## 5. 事务预算表（每个访问模式的读写集 + 冲突范围，供 Phase 3 填验收线）
+## 5. 事务预算表（每个访问模式的读写集 + 冲突范围；验收线 2026-10-15 按 Phase 3 lab-REAL 填写，`-09` §9）
 
-| 操作 | FDB 事务键写集 | 读集 | 冲突范围 | 原子性要求（不变量） | 验收线（待 Phase 3 填） |
+| 操作 | FDB 事务键写集 | 读集 | 冲突范围 | 原子性要求（不变量） | 验收线（lab-REAL 已填） |
 |---|---|---|---|---|---|
-| ns_create | dirent(0x20)+idx(0x21)+inode(0x10)+父 atomic+可选 | 父 inode | 父键 atomic 化后≈单键 | I-1 | ops/s ≥ RonDB shared 同并发 |
-| ns_remove | 删 dirent+idx+inode+父 atomic-1+gc(0x41) | dirent,inode | 单键 | I-2 | 同上 |
-| ns_rename（跨目录） | 源/目标 dirent+idx+双父 atomic+journal | 多键（TOCTOU 读）| **大**（路线 A 靠锁收窄 / 路线 B 靠快照）| I-3/I-4 | 零不变量破坏 + p99 预算 |
-| LAYOUTGET | 读（inode inline 或 0x30+0x31）| 1-N 键 | 无写 | I-6 | 提交延迟预算 |
-| SEQUENCE（slot）| 1 键(0x72) | 1 键 | 单键 | — | P50 ≤ ?（SLO）|
-| GC claim | 队头 atomic + K 行 claim | 前缀范围 | MDS 前缀内 | I-8 | claim 吞吐 + 无重复 |
+| ns_create | dirent(0x20)+idx(0x21)+inode(0x10)+父 atomic+可选 | 父 inode | 父键 atomic 化后≈单键 | I-1 | 热父 1→16T 324→3162 ops/s 近线性 9.8x、CHG 精确无丢失更新 → **结构 PASS**（冲突墙消除）；聚合 16T ≈ RonDB shared 14%，差距全为 17x 提交延迟（E-2/H-03）——原草案线"ops/s ≥ RonDB shared 同并发"**聚合未达标**，不代判，SLO 登记后按 K-3/K-8 判合规 |
+| ns_remove | 删 dirent+idx+inode+父 atomic-1+gc(0x41) | dirent,inode | 单键 | I-2 | 功能侧 PASS（S-7/S-7d + I-2/I-9 校验，含 1021 不重放 J-01）；吞吐未独立压测（RonDB 参照 `-01` ~2.2-2.5k ops/s@1T），吞吐线 **DEFERRED**（Phase 4） |
+| ns_rename（跨目录） | 源/目标 dirent+idx+双父 atomic+journal | 多键（TOCTOU 读）| **大**（路线 A 靠锁收窄 / 路线 B 靠快照）| I-3/I-4 | **DEFERRED**（rename 未实现，G1/NOSUPPORT；K-4 路线 A/B 未拍板，`-09` §9——唯一未触碰的正确性红线） |
+| LAYOUTGET | 读（inode inline 或 0x30+0x31）| 1-N 键 | 无写 | I-6 | **DEFERRED**（0x30/0x31 布局族切片外）；提交延迟锚点 2.3ms（H-03，`-00` §7.3） |
+| SEQUENCE（slot）| 1 键(0x72) | 1 键 | 单键 | — | **DEFERRED**（sessions/slots 协议态切片外）；P50 锚点 = 2.3ms 提交延迟，**SLO 尚空**（K-3，登记后立判） |
+| GC claim | 队头 atomic + K 行 claim | 前缀范围 | MDS 前缀内 | I-8 | **DEFERRED**（0x41-0x43 队列族未实现，K-2）；功能侧前置已证：S-11 批认领无双重分配 + J-01 幂等 |
 
 ---
 

@@ -1,6 +1,6 @@
 # FDB 可行性分析 Phase 3 — 工程实现与垂直切片实测
 
-日期: 2026-10-14 (更新中)
+日期: 2026-10-15（Phase 3 收官，含收尾登记）
 证据等级标注: **REAL**（本实验室实测）/ REFERENCE（文献/官方文档）/ HYPOTHESIS（推断）
 
 ## 1. 范围
@@ -324,3 +324,10 @@ DEFERRED 注明依赖。
 - [x] 更新 -08 报告的 Phase 3 章节（2026-10-15，commit 93bdd1f：§3
       "FDB 后端代码为零" 标记已消减 + 新增 §7 Phase 3 增量（lab-REAL），
       Defer 决策效力不变；已 push）
+- [x] 收尾登记（2026-10-15）：`-05` §5 事务预算表验收线按 lab-REAL 填写
+      （ns_create 原草案线"ops/s ≥ RonDB shared"**聚合未达标**（≈14%），
+      差距全为 17x 提交延迟 → 结构 PASS + 聚合待 SLO；其余 5 行切片外
+      标注 DEFERRED + 锚点）；`-04` §4 决策点状态更新（1021 库行为实测
+      关闭；dead-letter 前缀仍未定 = keyspace 评审缺口——`-05` §1 前缀表
+      无 dead-letter 前缀，0x43 是 prealloc_pool）；`-02` §B.3 归档目录
+      落地（`tests/empirical/results/fdb/`：manifest.json + README）

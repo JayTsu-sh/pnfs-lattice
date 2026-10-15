@@ -119,6 +119,12 @@
 2. dead-letter 键空间前缀 / 标记列命名（随 Phase 2 keyspace 设计定）。
 3. in-doubt 对账的扫描周期：复用现有"启动扫描 + 周期扫描"还是纯启动扫描？（现有 2PC 是启动扫描 rename_2pc.c:791；若运行期也可能产生 in-doubt，需加周期扫描——**这是相对 RonDB 的潜在新增运维项**，纳入 03 §2 运维维度评分）。
 
+**Phase 3 状态（2026-10-15，`-09` §8/§9）**：
+1. `MAX_POISON_RETRY` → 仍待 SLO 登记（SLO 尚空，不代填）。
+2. dead-letter 前缀 → **仍未定**：`-05` §1 前缀表中 0x43 = prealloc_pool，**没有 dead-letter 前缀**；`-05` §2.4 引用本节"retries 超限 → dead-letter 前缀"的语义但未分配具体前缀 → Phase 2 keyspace 评审缺口，需随清单第 18 项评审补上。
+3. in-doubt 扫描周期 → 仍待决策方（运维维度输入）。
+4. **1021（commit_unknown_result）库行为已实测关闭**（J-03，node 44，FDB 7.4.8）：`on_error(1021)` 正常返回并施加 backoff——库把 1021 当可重试（与官方文档一致），防双应用是应用层责任。切片修复：create/remove 遇 1021 **绝不重放** → DELAY（调用方重发时存在预检保证安全）；claim 可重放（最多浪费一个 1024 号窗，永不重发号）。下方复核命令"# Phase 3 实现时"就此闭环。
+
 ---
 
 ## 5. 复核命令

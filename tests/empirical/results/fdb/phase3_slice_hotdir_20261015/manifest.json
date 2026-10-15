@@ -1,0 +1,21 @@
+{
+  "run_id": "phase3_slice_hotdir_20261015",
+  "commit_sha": "63f07b6",
+  "backend": "fdb",
+  "env": {
+    "cluster": "3-node FDB 7.4.8, 10.131.9.44-46, triple-replicated ssd-2, client==server 7.4.8",
+    "run_host": "10.131.9.44 (QEMU 透传 AVX2, Ubuntu 24.04)",
+    "note": "lab 基准集群，非生产拓扑；等价性记录见 fdb-feasibility-06 §2"
+  },
+  "slo_anchor": "none（SLO 未登记，不代判）；对照锚点 = fdb-feasibility-01 §3 RonDB lab 基线 + fdb-feasibility-00 §7 H-01/H-03 微基准",
+  "evidence_class": "lab-REAL",
+  "raw_paths": [
+    "docs/fdb-feasibility-09-phase3-engineering.md#4（harness 28/28 逐断言，两轮复跑一致）",
+    "docs/fdb-feasibility-09-phase3-engineering.md#7（validate_invariants I-1/I-2/I-4/I-5/I-9 正向 + 负向注入）",
+    "docs/fdb-feasibility-09-phase3-engineering.md#8（注入测试 9/9，6 项 SKIPPED 注明原因）",
+    "docs/fdb-feasibility-09-phase3-engineering.md#9（fdb_hotdir_bench 1/2/4/8/16 线程逐 op 延迟表 verbatim）"
+  ],
+  "operator": "xiaonan.he（Hermes agent 协助）",
+  "timestamp": "2026-10-15",
+  "notes": "raw 终端转录在 Hermes 会话记录（node 44 执行）；文档表为 verbatim 原始输出。A/B 对照：FDB 侧本 run；RonDB 侧 = 既有归档 ../baseline_lattice_main/ + fdb-feasibility-01 §3（早于本规范，未补 manifest）。commit_sha 为全部代码定稿（K-1..K-9 压测所跑版本），其后 93bdd1f/45052a1 为纯文档提交。"
+}
