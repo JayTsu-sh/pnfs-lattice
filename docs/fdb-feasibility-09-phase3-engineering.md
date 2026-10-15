@@ -178,7 +178,36 @@ ENABLE_FDB=ON 才编译的 catalogue_fdb.c + 不在 ctest 里的 harness）。
 指标可直接采样；readdir 类指标（依赖 range 扫描）在 B-1 根因
 （KEYSEL 误用）修复后同样可测；K-4（rename，未实现）仍待后续槽位。
 
-## 7. 待办
+## 7. validate_invariants 首战（Phase 3 第 3 步，2026-10-14）
+
+只读校验器 `tests/empirical/validate_invariants.c`（-02 §B spec）落地
+并上真实集群：I-1/I-2（dirent→inode 闭环）、I-4（NL == 2+目录子项，
+逐父核对）、I-5（fileid 唯一 + ≤ FID 计数器单调）、I-9（无孤儿 +
+0x21/0x20 双写集合排序后逐对相等）；I-3/I-6/I-7/I-8 按切片边界
+SKIPPED（rename 未实现 / stripe / 协议态 / 队列不在切片）。
+
+**首战即抓到后端真 bug（I-4 FAIL，REAL）**：`0x00NL|parent3 = 1`
+（期望 2）。根因 = ns_remove 最终 unlink 对**所有**子类型无条件父
+NL -1，而 create 对文件子项是 +0 —— 删一个文件就把父目录 nlink
+减 1（POSIX 目录 nlink = 2 + 子目录数，文件删除不应动父 nlink）。
+对照 RonDB 权威实现 catalogue_rondb.c:925-926
+（`parent_nlink_delta = (type==DIR) ? -1 : 0`）确认语义后修复；
+harness 加 S-7d 回归断言（文件删除后父 nlink 不变）。此 bug 在
+27/27 全绿时 S-7 未查父 nlink 而漏网——校验器首战即兑现价值。
+（同期修了校验器自身一个坑：C 字符串字面量 `"\x00FID"` 被预处理
+器贪婪解析成 0x0F'ID'，改用显式字节数组。）
+
+**负向测试（validator 不是空转）**：注入一个孤儿 inode 键
+（fid=0xDEADBEEF12345678，value 1B 畸形）→ 校验器同时报
+I-1（value len 1≠285）/ I-5（超计数器 5122）/ I-9（孤儿）三条
+FAIL，样本精确点名 fid，rc=1；clear 注入键后回到 ALL PASS。
+正向：harness 终态上 I-1/I-4/I-5/I-9 全 PASS（104 inodes /
+103 dirents / 103 index rows，counter=5122）。
+
+**当前集群终态**：harness 28/28 两轮全绿（含 S-7d），
+validate_invariants ALL PASS。Phase 3 剩：9 注入测试、K-1..K-9 实测。
+
+## 8. 待办
 
 - [x] B-1 已解决（§4.3）：根因是 KeySelector 编码误用（begin=(1,0)
       应为 (0,1)），非集群异常；fdbcli 对照 + 黄金用例证实，23/23 全绿
@@ -186,7 +215,11 @@ ENABLE_FDB=ON 才编译的 catalogue_fdb.c + 不在 ctest 里的 harness）。
 - [x] atomic_op 热路径（§5）：FID ADD 批认领 + 0x21 二级索引，
       揪出 B-2（use-after-free）/ B-3（clamp 无符号 no-op）两个
       真 bug，27/27 两轮全绿（含 S-11 并发）
-- [ ] 提交热路径收尾 + 更新 -08 报告的 Phase 3 章节
-- [ ] validate_invariants I-1..I-9
+- [x] validate_invariants（§7）：首战抓到 B-4（remove 文件误减父
+      NL，与 create 的 +0 不对称；对照 RonDB 925-926 修复，S-7d
+      回归断言），负向测试注入孤儿 inode 精确触发 I-1/I-5/I-9；
+      harness 28/28 + validator ALL PASS
+- [ ] 更新 -08 报告的 Phase 3 章节
+- [ ] 9 注入测试
 - [ ] 9 注入测试
 - [ ] K-1..K-9 实测

@@ -304,6 +304,8 @@ int main(int argc, char **argv)
 	 * NL counts directory children; verify lookup NOTFOUND +
 	 * inode gone) */
 	if (file_fid) {
+		struct mds_inode nl_before, nl_after;
+		st = cat->auth_ops->ns_getattr(cat, dir_fid, &nl_before);
 		st = cat->auth_ops->ns_remove(cat, &txn, dir_fid, fname);
 		CHECK(st == MDS_OK, "S-7a remove file (st=%s)", stname(st));
 		st = cat->auth_ops->ns_lookup(cat, dir_fid, fname, &in);
@@ -313,6 +315,13 @@ int main(int argc, char **argv)
 		st = cat->auth_ops->ns_getattr(cat, file_fid, &in);
 		CHECK(st == MDS_ERR_NOTFOUND,
 		      "S-7c inode gone -> NOTFOUND (st=%s)", stname(st));
+		/* I-4 mirror: removing a FILE child must not move the
+		 * parent's nlink (dir nlink = 2 + dir children only;
+		 * the validator caught the old unconditional -1). */
+		st = cat->auth_ops->ns_getattr(cat, dir_fid, &nl_after);
+		CHECK(st == MDS_OK && nl_after.nlink == nl_before.nlink,
+		      "S-7d parent nlink unchanged by file remove (%u->%u)",
+		      nl_before.nlink, nl_after.nlink);
 	}
 
 	/* S-8: directory removal is a slice boundary -> NOSUPPORT */

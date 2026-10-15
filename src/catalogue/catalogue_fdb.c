@@ -630,11 +630,15 @@ static enum mds_status fdb_ns_remove(struct mds_catalogue *cat,
 		}
 		final = (child.nlink <= 1);
 		if (final) {
-			/* Last link: drop the child inode, decrement the
-			 * parent NL counter (its own key is cold -- the
-			 * child inode key write is fine). */
+			/* Last link: drop the child inode.  The parent
+			 * NL counter moves ONLY for directory children
+			 * (dir nlink = 2 + dir-children; file removal
+			 * never touches it) -- mirrors
+			 * catalogue_rondb.c:925-926
+			 * (parent_nlink_delta = (type == DIR) ? -1 : 0). */
 			fdb_transaction_clear(tr, ikey, 9);
-			fdb_add_op(nop, -1);
+			fdb_add_op(nop, (child.type == MDS_FTYPE_DIR)
+					? -1 : 0);
 		} else {
 			/* Hardlink: decrement child nlink in its own
 			 * (cold) inode; parent NL is unchanged. */
