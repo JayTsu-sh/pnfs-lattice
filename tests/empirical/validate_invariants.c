@@ -284,7 +284,7 @@ static int cb_dirent(const FDBKeyValue *kv, void *arg)
 		return 0;
 	}
 	if (g_ndir >= MAXT)
-		return;
+		return 0; /* over cap: stop recording, keep callback well-defined */
 	g_dirents[g_ndir].parent = be64(kv->key + 1);
 	g_dirents[g_ndir].child  = be64(kv->value);
 	g_ndir++;

@@ -277,8 +277,12 @@ int main(int argc, char *argv[])
 	struct mds_config cfg;
 	enum mds_status rc;
 	const char *config_path = "/etc/pnfs-mds/mds.conf";
-#ifdef HAVE_RONDB
+	/* Declared unconditionally: remove_manifest_init() (built in
+	 * every configuration) consumes the epoch, independent of the
+	 * RonDB backend.  Only the heartbeat thread / watchdog are
+	 * RonDB-specific. */
 	uint64_t rondb_boot_epoch = 0;
+#ifdef HAVE_RONDB
 	pthread_t rondb_hb_thread;
 	bool rondb_hb_running = false;
 #endif

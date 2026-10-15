@@ -191,6 +191,25 @@ static void fdb_conflict_backoff(FDBTransaction *tr, fdb_error_t err)
 	}
 }
 
+/* commit_unknown_result: the tx MAY have committed.  The client
+ * library's on_error() treats it as retryable (documented FDB
+ * behavior -- see the -04 spec and J-03 in
+ * fdb_injection_tests.c), so a blind retry could double-apply the
+ * staged writes.  The full fix is the -04 three-way reconciliation
+ * in the MDS journal plane (out of slice); the in-slice mitigation
+ * is to NEVER re-stage: report DELAY and let the caller re-issue,
+ * where the existence pre-checks make the replay safe.  The FID
+ * claim path is the exception: on 1021 its counter read was inside
+ * the maybe-committed tx, so replaying the claim at most WASTES a
+ * 1024-id window (the counter stays monotone; no id is ever
+ * handed out twice) -- retrying there cannot double-allocate. */
+#define FDB_ERR_COMMIT_UNKNOWN_RESULT 1021
+
+static int fdb_commit_maybe_applied(fdb_error_t err)
+{
+	return (int)err == FDB_ERR_COMMIT_UNKNOWN_RESULT;
+}
+
 /* -----------------------------------------------------------------------
  * Counter keys
  * ----------------------------------------------------------------------- */
@@ -547,6 +566,11 @@ static enum mds_status fdb_ns_create(struct mds_catalogue *cat,
 			fdb_transaction_destroy(tr);
 			break;
 		}
+		if (fdb_commit_maybe_applied(err)) {
+			/* J-03: never re-stage a maybe-committed tx. */
+			fdb_transaction_destroy(tr);
+			return MDS_ERR_DELAY;
+		}
 		fdb_conflict_backoff(tr, err);
 		fdb_transaction_reset(tr);
 		fdb_transaction_destroy(tr);
@@ -669,6 +693,11 @@ static enum mds_status fdb_ns_remove(struct mds_catalogue *cat,
 			fdb_transaction_destroy(tr);
 			catalog_stat_inc(&cat->stats.authority_writes);
 			return MDS_OK;
+		}
+		if (fdb_commit_maybe_applied(err)) {
+			/* J-03: never re-stage a maybe-committed tx. */
+			fdb_transaction_destroy(tr);
+			return MDS_ERR_DELAY;
 		}
 		fdb_conflict_backoff(tr, err);
 		fdb_transaction_destroy(tr);

@@ -205,9 +205,47 @@ FAIL，样本精确点名 fid，rc=1；clear 注入键后回到 ALL PASS。
 103 dirents / 103 index rows，counter=5122）。
 
 **当前集群终态**：harness 28/28 两轮全绿（含 S-7d），
-validate_invariants ALL PASS。Phase 3 剩：9 注入测试、K-1..K-9 实测。
+validate_invariants ALL PASS。
 
-## 8. 待办
+## 8. 注入测试（Phase 3 第 4 步，2026-10-15）
+
+`tests/empirical/fdb_injection_tests.c` 按 -04 §3 的 9 故障点清单落地
+切片可测子集（3 项实测 + 6 项 SKIPPED 并注明原因）。结果
+**9/9 PASS，两轮稳定**（node 44 真实集群）。
+
+**J-01 未知提交后重放（3.1 断网/kill 的切片可测核心 = 重试幂等性）**：
+recovery 重发已提交的 create → EXISTS、fileid 不变、父 CHG/NL 零
+副作用（重复 create 走只读存在预检，不 stage 写事务）、dirent 仍
+映射原 fileid。4/4 PASS——"fileid 不重复分配、nlink 不双减"在
+后端契约层成立。
+
+**J-03 commit_unknown_result(1021)**：实测 FDB 7.4.8 库行为——
+`on_error(1021)` **成功返回并施加 backoff**，即官方文档明确写的
+"库把 1021 当可重试，防双应用是应用层的责任"。断言与文档一致
+PASS。同时揪出切片真缺口：create/remove/claim 三个提交循环对
+**任何** commit 错误都 backoff+重放 ≤50 次 → 1021 会被盲重放。
+修复（本次入库）：新增 `fdb_commit_maybe_applied()`，create/remove
+遇 1021 **绝不重放**，立即返回 DELAY（调用方重发时存在预检保证
+安全）；claim 路径保留重试——1021 时重放 claim 最多浪费一个
+1024 号窗（计数器单调，永不重发号），不会双重分配。-04 的三分对账
+（commit/abort/unknown）属 MDS journal 面，留 journal 面实施。
+
+**J-06 读版本过旧中止（3.2）**：读集固定于旧版本的事务在并发写
+后提交 → 1020 abort，库保留并发写者值，无半成品写入。2/2 PASS。
+（FDB 7.4 无 set_read_snapshot；事务内旧读即固定读集版本，等价
+于陈旧快照机制。）
+
+**SKIPPED（子系统不在切片）**：J-02 kill-MDS（需 MDS 进程 +
+journal 扫描）、J-04 2PC rename 中途崩溃（rename 未实现，
+G1/NOSUPPORT，K-4 路线未拍板）、J-05 DS 通知副作用（DS 面）、
+J-07/J-08/J-09 毒 GC 行（0x41/0x42/0x43 keyspace + claim/TTL
+未实现）。6 项均输出 SKIPPED 行并注明原因，不假装通过。
+
+1021 修复回归：harness 28/28 两轮全绿、注入 9/9 两轮、
+validator ALL PASS。另修 validator 回调一处 UB（声明 int 却
+`return;` 无值——FDB 忽略回调返回值所以未爆，显式 `return 0`）。
+
+## 9. 待办
 
 - [x] B-1 已解决（§4.3）：根因是 KeySelector 编码误用（begin=(1,0)
       应为 (0,1)），非集群异常；fdbcli 对照 + 黄金用例证实，23/23 全绿
@@ -219,7 +257,8 @@ validate_invariants ALL PASS。Phase 3 剩：9 注入测试、K-1..K-9 实测。
       NL，与 create 的 +0 不对称；对照 RonDB 925-926 修复，S-7d
       回归断言），负向测试注入孤儿 inode 精确触发 I-1/I-5/I-9；
       harness 28/28 + validator ALL PASS
+- [x] 注入测试（§8）：J-01/J-03/J-06 实测 9/9 两轮稳定；J-03
+      揪出 1021 盲重放缺口并修复（create/remove 遇 1021 绝不
+      重放→DELAY；claim 可重放，只浪费号窗不重发号）
 - [ ] 更新 -08 报告的 Phase 3 章节
-- [ ] 9 注入测试
-- [ ] 9 注入测试
 - [ ] K-1..K-9 实测
