@@ -321,4 +321,6 @@ DEFERRED 注明依赖。
       墙，CHG 精确）、K-8 通过待 SLO 对照（p99 8.5ms 亚线性）、
       K-5 量化关闭（0x21 双写 ~8% 写字节）、K-7 确认关闭（零告警）；
       K-2/K-3/K-4/K-9 DEFERRED（切片外子系统）
-- [ ] 更新 -08 报告的 Phase 3 章节
+- [x] 更新 -08 报告的 Phase 3 章节（2026-10-15，commit 93bdd1f：§3
+      "FDB 后端代码为零" 标记已消减 + 新增 §7 Phase 3 增量（lab-REAL），
+      Defer 决策效力不变；已 push）
