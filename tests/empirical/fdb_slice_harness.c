@@ -19,6 +19,19 @@
  *   S-10 idempotent reopen: a second catalogue_fdb_open() on the same
  *        cluster sees the state created by the first (no root reset,
  *        counters intact)
+ *   S-11 4x25 concurrent creates on ONE hot parent: FID unique, parent
+ *        CHG exact +100 (no lost atomic updates), readdir = 100
+ *   S-12 stripe map round-trip: put(sc=4) -> get field-by-field,
+ *        del -> NOTFOUND, absent map -> NOTFOUND
+ *   S-13 layout grant/lookup/scan: grant(ds=2) -> get_by_stateid
+ *        field round-trip, scan_for_file true/false, ds_count=0 grant
+ *        still resolvable
+ *   S-14 protocol state round-trip: client/session/slot put -> get
+ *        field-by-field (incl. cached_reply blob), del -> NOTFOUND
+ *   S-15 concurrency: slot RMW storm (4x25, final seq exact +100) +
+ *        layout renewal storm on ONE stateid (4x10, final seqid
+ *        exact +40) -- FDB conflict retry must serialize same-key
+ *        writers with zero lost updates
  *
  * Exit 0 = all pass.  Evidence grade for the feasibility report:
  * this is a REAL measurement on the lab FDB cluster (7.4.8).
@@ -39,6 +52,8 @@
 #include "mds_log.h"
 #include "ds_prealloc.h"
 #include "pnfs_mds.h"
+#include "open_state.h"
+#include <stdbool.h>
 
 /* ---- stubs: the slice harness needs only these three external
  * symbols from outside {catalogue_fdb.c, rondb_schema.c} ---- */
@@ -148,6 +163,90 @@ static void *s11_worker(void *arg)
 			break;
 		}
 		c->fids[i] = out2.fileid;
+	}
+	return NULL;
+}
+
+/* ---- S-15 worker contexts (file scope: the worker must not be a
+ * nested function) ---- */
+struct s15_slot_ctx {
+	struct mds_catalogue *cat;
+	uint8_t sess[16];
+	uint32_t iters;
+	enum mds_status st;
+	uint32_t errors;
+};
+struct s15_layout_ctx {
+	struct mds_catalogue *cat;
+	uint8_t other[12];
+	uint64_t fid;
+	uint32_t iters;
+	enum mds_status st;
+};
+
+/* RMW increment on ONE (session, slot): read seq, write seq+1.
+ * With read-before-write in fdb_slot_put, concurrent increments on
+ * the same key must serialize -> every increment applies exactly
+ * once -> the final seq is EXACT (no lost updates). */
+static void *s15_slot_worker(void *arg)
+{
+	struct s15_slot_ctx *c = arg;
+	uint32_t i;
+
+	c->st = MDS_OK;
+	c->errors = 0;
+	for (i = 0; i < c->iters; i++) {
+		enum mds_status s2;
+		struct mds_coord_drc_slot_row row;
+
+		memset(&row, 0, sizeof(row));
+		s2 = c->cat->coord_ops->slot_get(c->cat, c->sess, 0, &row);
+		if (s2 != MDS_OK && s2 != MDS_ERR_NOTFOUND) {
+			c->errors++;
+			continue;
+		}
+		if (row.cached_reply != NULL)
+			free(row.cached_reply);
+		s2 = c->cat->coord_ops->slot_put(c->cat, c->sess, 0,
+				row.seq_id + 1, "r", 1);
+		if (s2 != MDS_OK) {
+			c->st = s2;
+			break;
+		}
+	}
+	return NULL;
+}
+
+/* RMW increment of the LAYOUT stateid seqid on ONE stateid
+ * (the SEQUENCE/LAYOUTGET renewal serialization property). */
+static void *s15_layout_worker(void *arg)
+{
+	struct s15_layout_ctx *c = arg;
+	uint32_t i;
+	uint64_t cid, fid, off, len;
+	uint32_t mode, seq;
+	struct nfs4_stateid sid;
+
+	c->st = MDS_OK;
+	for (i = 0; i < c->iters; i++) {
+		enum mds_status s2;
+
+		s2 = c->cat->coord_ops->layout_get_by_stateid(c->cat,
+				c->other, &cid, &fid, &mode, &off, &len,
+				&seq);
+		if (s2 != MDS_OK) {
+			c->st = s2;
+			break;
+		}
+		memset(&sid, 0, sizeof(sid));
+		sid.seqid = seq + 1;
+		memcpy(sid.other, c->other, 12);
+		s2 = c->cat->coord_ops->layout_grant(c->cat, NULL, cid,
+				c->fid, mode, off, len, &sid, NULL, 0);
+		if (s2 != MDS_OK) {
+			c->st = s2;
+			break;
+		}
 	}
 	return NULL;
 }
@@ -467,7 +566,373 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* final close (catalogue left open through S-11) */
+	/* S-12: stripe map family (0x30/0x31) -- LAYOUTGET read path.
+	 * put(sc=4) -> get must round-trip header + every entry
+	 * field-by-field; del -> NOTFOUND; a file without a map ->
+	 * NOTFOUND (the side-table contract, compound_layout.c:1025). */
+	{
+		uint64_t sm_fid = 0;
+		struct mds_ds_map_entry ents[4];
+		struct mds_ds_map_entry *back = NULL;
+		uint32_t sc, su, mc, e;
+
+		if (cat == NULL) {
+			printf("  SKIP S-12 (catalogue not open)\n");
+			goto s12_done;
+		}
+		st = cat->auth_ops->ns_create(cat, &txn, 2, "stripe_file",
+				MDS_FTYPE_REG, 0644, 0, 0, NULL, &child);
+		CHECK(st == MDS_OK, "S-12.0 stripe file create (st=%s)",
+		      stname(st));
+		if (st == MDS_OK)
+			sm_fid = child.fileid;
+
+		if (sm_fid) {
+			for (e = 0; e < 4; e++) {
+				ents[e].ds_id = 1 + e;
+				ents[e].nfs_fh_len = 16;
+				memset(ents[e].nfs_fh, 0, sizeof(ents[e].nfs_fh));
+				ents[e].nfs_fh[0] = (uint8_t)(0xA0 + e);
+				ents[e].nfs_fh[15] = (uint8_t)(e + 1);
+			}
+			st = cat->auth_ops->stripe_map_put(cat, &txn, sm_fid,
+					4, 1048576, 2, ents);
+			CHECK(st == MDS_OK, "S-12a stripe_map_put sc=4 (st=%s)",
+			      stname(st));
+			/* stripe_map_get backend-allocates *entries;
+			 * free + reset around every call. */
+			st = cat->auth_ops->stripe_map_get(cat, sm_fid,
+					&sc, &su, &mc, &back);
+			CHECK(st == MDS_OK && sc == 4 && su == 1048576 &&
+			      mc == 2,
+			      "S-12b get header (st=%s sc=%u su=%u mc=%u)",
+			      stname(st), sc, su, mc);
+			if (st == MDS_OK && sc == 4 && back != NULL) {
+				int ok = 1;
+				for (e = 0; e < 4; e++) {
+					if (back[e].ds_id != ents[e].ds_id ||
+					    back[e].nfs_fh_len !=
+						ents[e].nfs_fh_len ||
+					    memcmp(back[e].nfs_fh,
+						 ents[e].nfs_fh, 16) != 0)
+						ok = 0;
+				}
+				CHECK(ok,
+				      "S-12c 4 entries field-by-field (ds_id/fh)");
+			}
+			free(back);
+			back = NULL;
+			/* Absent map on a different file -> NOTFOUND. */
+			st = cat->auth_ops->ns_create(cat, &txn, 2,
+					"nostripe_file", MDS_FTYPE_REG,
+					0644, 0, 0, NULL, &child);
+			if (st == MDS_OK) {
+				st = cat->auth_ops->stripe_map_get(cat,
+						child.fileid, &sc, &su, &mc,
+						&back);
+				CHECK(st == MDS_ERR_NOTFOUND,
+				      "S-12d absent map -> NOTFOUND (st=%s)",
+				      stname(st));
+			}
+			free(back);
+			back = NULL;
+			st = cat->auth_ops->stripe_map_del(cat, &txn, sm_fid);
+			CHECK(st == MDS_OK, "S-12e stripe_map_del (st=%s)",
+			      stname(st));
+			st = cat->auth_ops->stripe_map_get(cat, sm_fid, &sc,
+					&su, &mc, &back);
+			CHECK(st == MDS_ERR_NOTFOUND,
+			      "S-12f after del -> NOTFOUND (st=%s)",
+			      stname(st));
+			free(back);
+			back = NULL;
+		}
+	}
+s12_done:
+
+	/* S-13: layout state family (0x50-0x54) -- pNFS grant path. */
+	{
+		uint64_t lg_fid = 0;
+		struct nfs4_stateid sid;
+		uint32_t ds_ids[2] = { 1, 2 };
+		uint64_t r_cid, r_fid;
+		uint32_t r_mode, r_seq;
+		uint64_t r_off, r_len;
+		bool has = true;
+
+		if (cat == NULL) {
+			printf("  SKIP S-13 (catalogue not open)\n");
+			goto s13_done;
+		}
+		st = cat->auth_ops->ns_create(cat, &txn, 2, "layout_file",
+				MDS_FTYPE_REG, 0644, 0, 0, NULL, &child);
+		CHECK(st == MDS_OK, "S-13.0 layout file create (st=%s)",
+		      stname(st));
+		if (st == MDS_OK)
+			lg_fid = child.fileid;
+
+		if (lg_fid) {
+			memset(&sid, 0, sizeof(sid));
+			sid.seqid = 1;
+			memcpy(sid.other, "\x01\x02\x03\x04\x05\x06\x07\x08"
+				 "\x09\x0a\x0b\x0c", 12);
+			st = cat->coord_ops->layout_grant(cat, &txn,
+					100, lg_fid, 2, 0, 1 << 20, &sid,
+					ds_ids, 2);
+			CHECK(st == MDS_OK, "S-13a grant client=100 ds=2 (st=%s)",
+			      stname(st));
+			st = cat->coord_ops->layout_get_by_stateid(cat,
+					sid.other, &r_cid, &r_fid, &r_mode,
+					&r_off, &r_len, &r_seq);
+			CHECK(st == MDS_OK && r_cid == 100 &&
+			      r_fid == lg_fid && r_mode == 2 && r_off == 0 &&
+			      r_len == (1 << 20) && r_seq == 1,
+			      "S-13b by_stateid round-trip (st=%s cid=%llu "
+			      "fid=%llu mode=%u off=%llu len=%llu seq=%u)",
+			      stname(st), (unsigned long long)r_cid,
+			      (unsigned long long)r_fid, r_mode,
+			      (unsigned long long)r_off,
+			      (unsigned long long)r_len, r_seq);
+			has = false;
+			st = cat->coord_ops->layout_scan_for_file(cat, lg_fid,
+					&has);
+			CHECK(st == MDS_OK && has,
+			      "S-13c scan_for_file granted (st=%s has=%d)",
+			      stname(st), (int)has);
+			has = true;
+			st = cat->coord_ops->layout_scan_for_file(cat, 2,
+					&has);
+			CHECK(st == MDS_OK && !has,
+			      "S-13d scan_for_file ungranted (st=%s has=%d)",
+			      stname(st), (int)has);
+			/* ds_count=0 grant (no 0x53 rows) still resolves. */
+			sid.seqid = 7;
+			sid.other[11] ^= 0xff;
+			st = cat->coord_ops->layout_grant(cat, &txn,
+					101, lg_fid, 1, 0, 4096, &sid,
+					NULL, 0);
+			CHECK(st == MDS_OK, "S-13e grant ds_count=0 (st=%s)",
+			      stname(st));
+			st = cat->coord_ops->layout_get_by_stateid(cat,
+					sid.other, &r_cid, &r_fid, &r_mode,
+					&r_off, &r_len, &r_seq);
+			CHECK(st == MDS_OK && r_cid == 101 && r_seq == 7 &&
+			      r_fid == lg_fid,
+			      "S-13f ds_count=0 resolves (st=%s cid=%llu seq=%u)",
+			      stname(st), (unsigned long long)r_cid, r_seq);
+			/* Unknown stateid -> NOTFOUND. */
+			sid.other[0] ^= 0xff;
+			st = cat->coord_ops->layout_get_by_stateid(cat,
+					sid.other, &r_cid, &r_fid, &r_mode,
+					&r_off, &r_len, &r_seq);
+			CHECK(st == MDS_ERR_NOTFOUND,
+			      "S-13g unknown stateid -> NOTFOUND (st=%s)",
+			      stname(st));
+		}
+	}
+s13_done:
+
+	/* S-14: NFSv4.1 protocol state (0x70-0x73) -- SEQUENCE hot path. */
+	{
+		struct mds_coord_client_row cl, clb;
+		struct mds_coord_session_row ss, ssb;
+		struct mds_coord_drc_slot_row sl;
+		const char *reply = "cached-reply-bytes";
+
+		if (cat == NULL) {
+			printf("  SKIP S-14 (catalogue not open)\n");
+			goto s14_done;
+		}
+		memset(&cl, 0, sizeof(cl));
+		cl.clientid = 200;
+		cl.co_ownerid_len = 11;
+		memcpy(cl.co_ownerid, "test-client", 11);
+		memcpy(cl.verifier, "verifier", 8);
+		cl.confirmed = true;
+		cl.owner_mds_id = 0;
+		cl.owner_boot_epoch = 7;
+		cl.lease_renewed_ns = 123456;
+		st = cat->coord_ops->client_put(cat, &cl);
+		CHECK(st == MDS_OK, "S-14a client_put (st=%s)", stname(st));
+		st = cat->coord_ops->client_get(cat, 200, &clb);
+		CHECK(st == MDS_OK && clb.clientid == 200 &&
+		      clb.co_ownerid_len == 11 &&
+		      memcmp(clb.co_ownerid, "test-client", 11) == 0 &&
+		      clb.confirmed && clb.owner_boot_epoch == 7 &&
+		      clb.lease_renewed_ns == 123456 &&
+		      memcmp(clb.verifier, "verifier", 8) == 0,
+		      "S-14b client_get round-trip (st=%s len=%u)",
+		      stname(st), clb.co_ownerid_len);
+
+		memset(&ss, 0, sizeof(ss));
+		memcpy(ss.session_id, "session-id-000", 14);
+		ss.clientid = 200;
+		ss.num_slots = 64;
+		ss.cb_prog = 1;
+		ss.cb_sec_flavor = 3;
+		ss.owner_mds_id = 0;
+		ss.owner_boot_epoch = 7;
+		ss.created_ns = 999;
+		st = cat->coord_ops->session_put(cat, &ss);
+		CHECK(st == MDS_OK, "S-14c session_put (st=%s)", stname(st));
+		st = cat->coord_ops->session_get(cat, ss.session_id, &ssb);
+		CHECK(st == MDS_OK && ssb.clientid == 200 &&
+		      ssb.num_slots == 64 && ssb.cb_prog == 1 &&
+		      ssb.cb_sec_flavor == 3 && ssb.owner_boot_epoch == 7 &&
+		      ssb.created_ns == 999,
+		      "S-14d session_get round-trip (st=%s slots=%u)",
+		      stname(st), ssb.num_slots);
+
+		st = cat->coord_ops->slot_put(cat, ss.session_id, 3, 42,
+				reply, (uint32_t)strlen(reply));
+		CHECK(st == MDS_OK, "S-14e slot_put seq=42 (st=%s)",
+		      stname(st));
+		st = cat->coord_ops->slot_get(cat, ss.session_id, 3, &sl);
+		CHECK(st == MDS_OK && sl.slot_id == 3 && sl.seq_id == 42 &&
+		      sl.reply_len == (uint32_t)strlen(reply) &&
+		      sl.cached_reply != NULL &&
+		      memcmp(sl.cached_reply, reply, sl.reply_len) == 0 &&
+		      sl.last_used_ns > 0,
+		      "S-14f slot_get round-trip (st=%s seq=%u rlen=%u)",
+		      stname(st), sl.seq_id, sl.reply_len);
+		if (sl.cached_reply != NULL)
+			free(sl.cached_reply);
+		st = cat->coord_ops->slot_get(cat, ss.session_id, 99, &sl);
+		CHECK(st == MDS_ERR_NOTFOUND,
+		      "S-14g empty slot -> NOTFOUND (st=%s)", stname(st));
+
+		/* Slot on a session that exists but the session is
+		 * deleted -> slot still there (no cascade; matches the
+		 * NDB schema: drc_slots has no FK cascade), then
+		 * session_get NOTFOUND. */
+		st = cat->coord_ops->session_del(cat, ss.session_id);
+		CHECK(st == MDS_OK, "S-14h session_del (st=%s)", stname(st));
+		st = cat->coord_ops->session_get(cat, ss.session_id, &ssb);
+		CHECK(st == MDS_ERR_NOTFOUND,
+		      "S-14i session after del -> NOTFOUND (st=%s)",
+		      stname(st));
+		st = cat->coord_ops->session_del(cat, ss.session_id);
+		CHECK(st == MDS_ERR_NOTFOUND,
+		      "S-14j double del -> NOTFOUND (st=%s)", stname(st));
+		st = cat->coord_ops->client_del(cat, 200);
+		CHECK(st == MDS_OK, "S-14k client_del (st=%s)", stname(st));
+		st = cat->coord_ops->client_get(cat, 200, &clb);
+		CHECK(st == MDS_ERR_NOTFOUND,
+		      "S-14l client after del -> NOTFOUND (st=%s)",
+		      stname(st));
+	}
+s14_done:
+
+	/* S-15: same-key RMW storms -- the SEQUENCE/LAYOUTGET renewal
+	 * serialization property.  FDB conflict retry must serialize
+	 * writers on the same key: every increment applies exactly
+	 * once, so the final value is EXACT (no lost updates).
+	 * 4 threads x 25 slot increments (read seq, write seq+1) ->
+	 * final 100; 4 threads x 10 layout renewals (read seqid,
+	 * write seqid+1, same stateid) -> final 40. */
+	{
+		struct mds_coord_session_row ss;
+		struct mds_coord_drc_slot_row sl;
+		struct nfs4_stateid sid;
+		pthread_t th[4];
+		int t;
+		struct s15_slot_ctx s15s[4];
+		struct s15_layout_ctx s15l[4];
+
+		if (cat == NULL) {
+			printf("  SKIP S-15 (catalogue not open)\n");
+			goto s15_done;
+		}
+		memset(&ss, 0, sizeof(ss));
+		memcpy(ss.session_id, "s15-sess", 8);
+		ss.clientid = 300;
+		ss.num_slots = 128;
+		ss.cb_prog = 1;
+		ss.cb_sec_flavor = 3;
+		st = cat->coord_ops->session_put(cat, &ss);
+		CHECK(st == MDS_OK, "S-15.0 seed session (st=%s)", stname(st));
+
+		if (st == MDS_OK) {
+			for (t = 0; t < 4; t++) {
+				s15s[t].cat = cat;
+				memcpy(s15s[t].sess, ss.session_id, 16);
+				s15s[t].iters = 25;
+				s15s[t].st = MDS_OK;
+				s15s[t].errors = 0;
+				pthread_create(&th[t], NULL,
+						s15_slot_worker, &s15s[t]);
+			}
+			for (t = 0; t < 4; t++)
+				pthread_join(th[t], NULL);
+			for (t = 0; t < 4; t++) {
+				if (s15s[t].st != MDS_OK) {
+					printf("  (S-15 t%d st=%s err=%u)\n",
+					       t, stname(s15s[t].st),
+					       s15s[t].errors);
+				}
+			}
+			st = cat->coord_ops->slot_get(cat, ss.session_id, 0,
+					&sl);
+			CHECK(st == MDS_OK && sl.seq_id == 100,
+			      "S-15a slot storm final seq=%u (want 100, st=%s)",
+			      sl.seq_id, stname(st));
+			if (sl.cached_reply != NULL)
+				free(sl.cached_reply);
+		}
+
+		/* Layout renewal storm: one stateid, 4 threads x 10. */
+		if (cat != NULL) {
+			uint64_t lg_fid = 0;
+			uint32_t r_seq = 0;
+			st = cat->auth_ops->ns_create(cat, &txn, 2,
+					"renew_file", MDS_FTYPE_REG, 0644,
+					0, 0, NULL, &child);
+			CHECK(st == MDS_OK, "S-15.1 renew file create (st=%s)",
+			      stname(st));
+			if (st == MDS_OK) {
+				lg_fid = child.fileid;
+				memset(&sid, 0, sizeof(sid));
+				sid.seqid = 0;
+				memcpy(sid.other, "s15-layout", 10);
+				st = cat->coord_ops->layout_grant(cat, &txn,
+						400, lg_fid, 2, 0, 4096,
+						&sid, NULL, 0);
+				CHECK(st == MDS_OK,
+				      "S-15.2 seed grant seqid=0 (st=%s)",
+				      stname(st));
+				if (st == MDS_OK) {
+					for (t = 0; t < 4; t++) {
+						s15l[t].cat = cat;
+						memcpy(s15l[t].other,
+							sid.other, 12);
+						s15l[t].fid = lg_fid;
+						s15l[t].iters = 10;
+						s15l[t].st = MDS_OK;
+						pthread_create(&th[t], NULL,
+							s15_layout_worker,
+							&s15l[t]);
+					}
+					for (t = 0; t < 4; t++)
+						pthread_join(th[t], NULL);
+					for (t = 0; t < 4; t++)
+						if (s15l[t].st != MDS_OK)
+							printf("  (S-15L t%d st=%s)\n",
+							       t,
+							       stname(s15l[t].st));
+					st = cat->coord_ops->layout_get_by_stateid(
+							cat, sid.other, NULL,
+							NULL, NULL, NULL, NULL,
+							&r_seq);
+					CHECK(st == MDS_OK && r_seq == 40,
+					      "S-15b renewal storm final seqid=%u (want 40, st=%s)",
+					      r_seq, stname(st));
+				}
+			}
+		}
+	}
+s15_done:
+
+	/* final close (catalogue left open through S-11..S-15) */
 s11_done:
 	if (cat != NULL)
 		cat->ops->close(cat);

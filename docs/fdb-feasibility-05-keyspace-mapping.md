@@ -40,6 +40,7 @@ FDB 与 NDB 的**根本差异**决定了 keyspace 设计的所有难点：
 0x43  prealloc_pool   预分配槽（fileid 主键 + owner 分片）
 0x50  layout_state    (fileid, stateid) 主
 0x51  layout_by_client / 0x52 by_file / 0x53 ds_layout_idx  三个二级
+0x54  layout_by_stateid   stateid 反向索引（NDB ix_layout_state_stateid 等价，2026-10-15 补登记）
 0x60  open_state      (fileid, stateid) 主 / 0x61 by_file / 0x62 by_client
 0x63  byte_range_locks / 0x64 lock_by_owner
 0x65  delegations     / 0x66 by_file / 0x67 by_client
@@ -103,10 +104,10 @@ FDB 与 NDB 的**根本差异**决定了 keyspace 设计的所有难点：
 - 多 stripe：LAYOUTGET = 1 点头 + N 点读明细（N=stripe_count）。**冲突范围小**（fileid 维度），非热点。
 
 ### 2.6 NFSv4 有状态协议表（0x50-0x73）★ H-03 热路径
-- **layout_state** 主键 `0x50 ‖ fileid(8) ‖ stateid_other(8)`（NDB PK，rondb_schema.h:406）；二级 `0x51`(by_client)、`0x52`(by_file)、`0x53` ds_layout_idx `(ds_id,clientid,fileid)` → 各需双向写。
+- **layout_state** 主键 `0x50 ‖ fileid(8) ‖ stateid_other(12)`（NDB PK，rondb_schema.h:406；stateid_other 为 wire 12 字节）；二级 `0x51`(by_client)、`0x52`(by_file)、`0x53` ds_layout_idx `(ds_id,clientid,fileid)`、**`0x54` by_stateid 反向索引**（`0x54 ‖ stateid_other(12)` → (fileid, clientid)，NDB `ix_layout_state_stateid` 等价）→ 各需双向写。0x54 为 2026-10-15 Phase 4 C-12 增量补登记：NDB 侧 stateid 点查走 ix_layout_state_stateid，无此槽位 `layout_get_by_stateid` 无法实现（此前前缀表漏列，评审缺口）。
 - **open_state / byte_range_locks / delegations** 同构：主表 + by_file + by_client 双向索引。
 - **sessions / drc_slots（0x72）= NFSv4.1 SEQUENCE 热路径**：每请求一次 slot 写。**H-03 已证**：单键写提交 p50≈2.3ms（`fdb-feasibility-01`/`00` §7.3）。
-  - **设计**：slot 键 `0x72 ‖ session_id ‖ slot_id` → value (seqid, ...)。每请求 1 键写，提交延迟进入 P50。
+  - **设计**：slot 键 `0x72 ‖ clientid(8) ‖ slot(4)` → value (seqid, ...)（NDB `mds_drc_slots` PK=(clientid,slot_id)，rondb_schema.h:675+ 列定义；此前本节误写 session_id，2026-10-15 对照 NDB schema 更正）。每请求 1 键写，提交延迟进入 P50。
   - **缓解（HYPOTHESIS，Phase 3 专项）**：(a) 连接/事务池复用（避免每请求建事务）；(b) 批合并（同 session 同槽的幂等重放不重复写）；(c) 若 SLO 对 P50 敏感，评估 slot 状态**内存化 + 异步落盘**（grace 恢复用 0x73 clients + journal 兜底）。**是否可接受取决于尚空的 SLO 登记**（`fdb-feasibility-00` §7.3）。
 
 ### 2.7 协调 / 恢复表（0x80-0x82, 0xC0, 0x90）
@@ -165,8 +166,8 @@ FDB 与 NDB 的**根本差异**决定了 keyspace 设计的所有难点：
 | ns_create | dirent(0x20)+idx(0x21)+inode(0x10)+父 atomic+可选 | 父 inode | 父键 atomic 化后≈单键 | I-1 | 热父 1→16T 324→3162 ops/s 近线性 9.8x、CHG 精确无丢失更新 → **结构 PASS**（冲突墙消除）；聚合 16T ≈ RonDB shared 14%，差距全为 17x 提交延迟（E-2/H-03）——原草案线"ops/s ≥ RonDB shared 同并发"**聚合未达标**，不代判，SLO 登记后按 K-3/K-8 判合规 |
 | ns_remove | 删 dirent+idx+inode+父 atomic-1+gc(0x41) | dirent,inode | 单键 | I-2 | 功能侧 PASS（S-7/S-7d + I-2/I-9 校验，含 1021 不重放 J-01）；吞吐未独立压测（RonDB 参照 `-01` ~2.2-2.5k ops/s@1T），吞吐线 **DEFERRED**（Phase 4） |
 | ns_rename（跨目录） | 源/目标 dirent+idx+双父 atomic+journal | 多键（TOCTOU 读）| **大**（路线 A 靠锁收窄 / 路线 B 靠快照）| I-3/I-4 | **DEFERRED**（rename 未实现，G1/NOSUPPORT；K-4 路线 A/B 未拍板，`-09` §9——唯一未触碰的正确性红线） |
-| LAYOUTGET | 读（inode inline 或 0x30+0x31）| 1-N 键 | 无写 | I-6 | **DEFERRED**（0x30/0x31 布局族切片外）；提交延迟锚点 2.3ms（H-03，`-00` §7.3） |
-| SEQUENCE（slot）| 1 键(0x72) | 1 键 | 单键 | — | **DEFERRED**（sessions/slots 协议态切片外）；P50 锚点 = 2.3ms 提交延迟，**SLO 尚空**（K-3，登记后立判） |
+| LAYOUTGET | 读（inode inline 或 0x30+0x31）| 1-N 键 | 无写 | I-6 | **DEFERRED**（lab 实测待跑）：0x30/0x31 stripe map 族已实现（2026-10-15 C-12 增量，单事务头+N 明细同 NDB 形状）+ harness S-12 功能断言 + I-6 引用闭环校验实现，本地双树编译通过；lab 集群运行受阻（node 44 ssh publickey 被拒，挂起项）→ 实测后填 lab-REAL。提交延迟锚点 2.3ms（H-03，`-00` §7.3） |
+| SEQUENCE（slot）| 1 键(0x72) | 1 键 | 单键 | — | **DEFERRED**（lab 实测待跑）：0x70-0x73 协议态族已实现（2026-10-15 C-12 增量，含 slot/layout **read-before-write RMW**——FDB 只对同事务内读过的键产生冲突，纯写事务会丢更新）+ harness S-14/S-15（同键并发 RMW 风暴，终值精确断言）+ I-7 一致性校验 + mixed_load_bench（-06 §1.2.4 配方 1→16T）实现，本地编译通过；lab 运行受阻同上 → 实测后填 lab-REAL。P50 锚点 = 2.3ms 提交延迟，**SLO 尚空**（K-3，登记后立判） |
 | GC claim | 队头 atomic + K 行 claim | 前缀范围 | MDS 前缀内 | I-8 | **DEFERRED**（0x41-0x43 队列族未实现，K-2）；功能侧前置已证：S-11 批认领无双重分配 + J-01 幂等 |
 
 ---

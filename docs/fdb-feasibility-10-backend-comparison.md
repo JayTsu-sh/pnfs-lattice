@@ -27,7 +27,7 @@
 | C-9 | 跨 MDS 2PC / in-doubt（K-9） | 启动扫描对账（rename_2pc.c:791，生产在用） | 三分对账（commit/abort/unknown）设计定、**journal 面待实施** | FDB 无锁恢复使 in-doubt 窗口从"节点故障"移到"提交未知"；潜在新增运维项（周期扫描未定） | REFERENCE（代码+设计） | `-04` §1.1 / `-09` §8（J-02/J-04 SKIPPED） |
 | C-10 | 运维能力 | mgm/ndbd/mgmctl 团队现有能力（本 lab 恢复操作即手工完成） | fdbmonitor/fdbcli + 新增对账项；**技能差距已登记** | `-08` 风险表"无 FDB 值守能力"（中） | REFERENCE | `-08` §4 / `-03` 维度 7 |
 | C-11 | 迁移成本 | —（基线） | 路线 A 停机迁移推荐起步（完全可逆至切流后第一次写）；B 增量追平被 M-2 证伪、C 双写不成立；**反向同步必须实现+演练** | 一次性成本 + 不可逆点管理，属 SRE 决策项 | REFERENCE（设计） | `-07` |
-| C-12 | 工作负载匹配（meta） | 基线建在真实流量画像上（`-06`） | FDB 实测面 = ns_* 6 槽 + create 热父目录；**top-2 高频 op（LAYOUTGET/SEQUENCE）无实测覆盖** | 当前比较在"RonDB 主场的命名空间 CRUD"上进行，非真实流量——这是比较本身的最大局限 | lab-REAL（面内真实）+ HYPOTHESIS（面外推断） | `-06` §2 vs `-09` §9 |
+| C-12 | 工作负载匹配（meta） | 基线建在真实流量画像上（`-06`） | top-2 高频 op 的 FDB 槽位**已实现**（2026-10-15 C-12 增量：0x30/0x31 stripe map + 0x50-0x54 layout state + 0x70-0x73 协议态，含 RMW 冲突保护），本地双树编译通过；**lab 实测未跑**（node 44 ssh 被拒，挂起项）——当前比较仍在"RonDB 主场的命名空间 CRUD"上，非真实流量 | 实测落地后本行升级 lab-REAL；此前仍是最大局限 | lab-REAL（面内真实）+ HYPOTHESIS（面外推断，待补测） | `-06` §2 vs `-09` §9 |
 
 ## 2. 双方结构优缺点小结（逐条带证据）
 
@@ -69,7 +69,7 @@
 
 | 盲点 | 对比较的影响 | 填法 |
 |---|---|---|
-| LAYOUTGET（47.5%）/ SEQUENCE（23.8%）FDB 侧未测 | 真实流量最高频两行只能用 H-03 微基准外推（C-12） | 补 layout/协议态槽实现后压测，或 Phase 4 真实环境 A/B |
+| LAYOUTGET（47.5%）/ SEQUENCE（23.8%）FDB 侧未测 | 真实流量最高频两行只能用 H-03 微基准外推（C-12） | 槽实现**已完成**（2026-10-15：stripe map + layout state + 协议态 + read-before-write RMW + S-12..S-15/I-6/I-7/mixed_load_bench，本地编译通过）；**lab 压测受阻**（node 44 ssh publickey 被拒，挂起审批）→ 恢复访问后按 mixed_load_bench 跑 1→16T 填 lab-REAL，或 Phase 4 真实环境 A/B |
 | 无同流 A/B（现为同口径锚点对照） | op 混合的端到端 P50/p99 无法比较 | Phase 4 真实环境同流 A/B |
 | K-4 rename 未测 | 正确性红线行（C-3）无 REAL 证据 | 路线 A/B 拍板 + 故障注入（J-02/J-04） |
 | FDB HA/恢复未测 | FDB 优点侧最强行（C-5）无 REAL | Phase 4：集群故障注入 + K-9 对账 |

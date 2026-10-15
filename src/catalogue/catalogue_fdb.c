@@ -5,8 +5,10 @@
  * catalogue_fdb.c -- FoundationDB catalogue backend (Phase 3 vertical
  * slice).
  *
- * Implements the six core namespace slots of mds_authority_ops on top of
- * the FDB C API (7.4), with the keyspace layout from
+ * Implements the six core namespace slots of mds_authority_ops plus the
+ * layout-state family (stripe maps + layout_state, coordination vtable)
+ * and the NFSv4.1 protocol-state family (sessions/clients/drc slots)
+ * on top of the FDB C API (7.4), with the keyspace layout from
  * docs/fdb-feasibility-05-keyspace-mapping.md:
  *
  *   0x00  meta counters
@@ -20,6 +22,9 @@
  *                          value = name(NUL)  (secondary index, -05 §2.2:
  *                          READDIR-by-fid + name-reuse detection; dual-write
  *                          on create, dual-clear on remove)
+ *   0x30/0x31  stripe maps  LAYOUTGET read path (-05 §2.5)
+ *   0x50-0x54  layout state pNFS grant path (-05 §2.6, +0x54 refinement)
+ *   0x70-0x73  protocol state SEQUENCE hot path (-05 §2.6)
  *
  * Design decisions carried over from the paper analysis (-05):
  *   - A directory's nlink and change live in INDEPENDENT full-width
@@ -41,9 +46,10 @@
  *     mds_status_to_nfs4 maps to a stable NFS4ERR_NOTSUPP instead of
  *     NFS4ERR_SERVERFAULT.
  *
- * NOT production-ready: rename/link/xattr/queues/stateful-NFS paths are
- * intentionally unimplemented in the slice; the lab config that enables
- * this backend must not run real workloads beyond the six slots.
+ * NOT production-ready: rename/link/xattr/queues + the open/lock/deleg
+ * coordination paths are intentionally unimplemented in the slice; the
+ * lab config that enables this backend must not run real workloads
+ * beyond the implemented slots.
  */
 
 #define FDB_API_VERSION 740
@@ -61,6 +67,7 @@
 #include "rondb_schema.h"
 #include "mds_log.h"
 #include "ds_prealloc.h"
+#include "open_state.h"
 
 #define FDB_RETRY_MAX 50
 
@@ -891,6 +898,878 @@ static enum mds_status fdb_ns_readdir(struct mds_catalogue *cat,
 }
 
 /* -----------------------------------------------------------------------
+ * Stripe map family (0x30/0x31) -- LAYOUTGET read path (-05 §2.5).
+ *
+ *   0x30 header  key = 0x30 | fileid(8BE)
+ *                value = stripe_count(4BE) | stripe_unit(4BE) |
+ *                        mirror_count(4BE)
+ *   0x31 entries key = 0x31 | fileid(8BE) | ordinal(2BE)
+ *                value = rondb_stripe_entry_serialize() flat row
+ *                        (ds_id(4) | fh_len(4) | fh[MDS_NFS_FH_MAX])
+ *
+ * Multi-stripe files live here; single-stripe inline files carry their
+ * stripe in the inode wire (MDS_IFLAG_INLINE_STRIPE) and never create
+ * 0x30/0x31 keys (-05 §2.5, rondb_schema.h:222-227).  The header + all
+ * entries are written in ONE transaction (NDB does the same: one
+ * mds_stripe_maps row + N mds_stripe_entries rows, single txn).
+ * ----------------------------------------------------------------------- */
+
+#define SM_HDR_LEN   9
+#define SM_HDR_VAL   12
+#define SM_ENTRY_LEN 11
+
+static void fdb_put_u32_be(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+	p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
+}
+
+static uint32_t fdb_get_u32_be(const uint8_t *p)
+{
+	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+	       ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+}
+
+static void sm_hdr_key(uint8_t *k, uint64_t fileid)
+{
+	k[0] = 0x30;
+	fdb_put_u64_be(k + 1, fileid);
+}
+
+static void sm_entry_key(uint8_t *k, uint64_t fileid, uint32_t ordinal)
+{
+	k[0] = 0x31;
+	fdb_put_u64_be(k + 1, fileid);
+	k[9]  = (uint8_t)(ordinal >> 8);
+	k[10] = (uint8_t)ordinal;
+}
+
+static enum mds_status fdb_stripe_map_get(struct mds_catalogue *cat,
+		uint64_t fileid, uint32_t *sc, uint32_t *su,
+		uint32_t *mc, struct mds_ds_map_entry **entries)
+{
+	struct fdb_state *s = fdb_state(cat);
+	uint8_t hkey[SM_HDR_LEN], hval[SM_HDR_VAL];
+	uint8_t bkey[SM_ENTRY_LEN], ekey[SM_ENTRY_LEN + 1];
+	FDBTransaction *tr;
+	FDBFuture *f;
+	const FDBKeyValue *kvs;
+	int kvcount, i;
+	int rc;
+
+	if (s == NULL || sc == NULL || su == NULL || mc == NULL ||
+	    entries == NULL) {
+		return MDS_ERR_INVAL;
+	}
+
+	tr = fdb_begin(s->db);
+	sm_hdr_key(hkey, fileid);
+	rc = fdb_txn_get(tr, hkey, SM_HDR_LEN, hval, sizeof(hval));
+	if (rc < 0) {
+		fdb_transaction_destroy(tr);
+		return MDS_ERR_IO;
+	}
+	if (rc != SM_HDR_VAL) {
+		fdb_transaction_destroy(tr);
+		return MDS_ERR_NOTFOUND;
+	}
+
+	/* Entry range [0x31|fileid|0x0000, 0x31|(fileid+1)|0x0000).
+	 * KEYSEL encoding per the KEYSEL macros in fdb_c.h (B-1):
+	 * both bounds FIRST_GREATER_OR_EQUAL = (k,l,0,1); an exclusive
+	 * end with (0,0) would silently drop the last entry.  Wrap
+	 * guard: at max fileid the bound is the next key band (0x32). */
+	sm_entry_key(bkey, fileid, 0);
+	if (fileid == UINT64_MAX) {
+		ekey[0] = 0x32;
+	} else {
+		sm_entry_key(ekey, fileid + 1, 0);
+	}
+	f = fdb_transaction_get_range(tr,
+			bkey, SM_ENTRY_LEN, 0, 1,
+			ekey, fileid == UINT64_MAX ? 1 : SM_ENTRY_LEN, 0, 1,
+			MDS_MAX_STRIPES + 1, 0, FDB_STREAMING_MODE_WANT_ALL,
+			0, 0, 0);
+	fdb_future_block_until_ready(f);
+	rc = (int)fdb_future_get_error(f);
+	if (rc != 0) {
+		fdb_future_destroy(f);
+		fdb_transaction_destroy(tr);
+		return MDS_ERR_IO;
+	}
+	{
+		fdb_bool_t more = 0;
+		fdb_error_t e2 = fdb_future_get_keyvalue_array(f, &kvs,
+				&kvcount, &more);
+		if (e2 != 0) {
+			fdb_future_destroy(f);
+			fdb_transaction_destroy(tr);
+			return MDS_ERR_IO;
+		}
+	}
+	*sc = fdb_get_u32_be(hval);
+	*su = fdb_get_u32_be(hval + 4);
+	*mc = fdb_get_u32_be(hval + 8);
+	if (kvcount > MDS_MAX_STRIPES) {
+		kvcount = MDS_MAX_STRIPES; /* defensive: key space bounded */
+	}
+	if (*sc == 0) {
+		*entries = NULL;
+		fdb_future_destroy(f);
+		fdb_transaction_destroy(tr);
+		return MDS_OK;
+	}
+	*entries = calloc(*sc, sizeof(**entries));
+	if (*entries == NULL) {
+		fdb_future_destroy(f);
+		fdb_transaction_destroy(tr);
+		return MDS_ERR_NOMEM;
+	}
+	for (i = 0; i < (int)*sc && i < kvcount; i++) {
+		if (rondb_stripe_entry_deserialize(
+			    kvs[i].value, (size_t)kvs[i].value_length,
+			    &(*entries)[i]) != 0) {
+			free(*entries);
+			*entries = NULL;
+			fdb_future_destroy(f);
+			fdb_transaction_destroy(tr);
+			return MDS_ERR_IO;
+		}
+	}
+	fdb_future_destroy(f);
+	fdb_transaction_destroy(tr);
+	return MDS_OK;
+}
+
+static enum mds_status fdb_stripe_map_put(struct mds_catalogue *cat,
+		struct mds_cat_txn *txn, uint64_t fileid,
+		uint32_t sc, uint32_t su, uint32_t mc,
+		const struct mds_ds_map_entry *entries)
+{
+	struct fdb_state *s = fdb_state(cat);
+	uint8_t hkey[SM_HDR_LEN], hval[SM_HDR_VAL];
+	uint32_t attempt, i;
+	int staged;
+
+	(void)txn;
+	if (s == NULL) return MDS_ERR_INVAL;
+	if (sc > 0 && entries == NULL) return MDS_ERR_INVAL;
+	if (sc > MDS_MAX_STRIPES) return MDS_ERR_INVAL;
+
+	fdb_put_u32_be(hval, sc);
+	fdb_put_u32_be(hval + 4, su);
+	fdb_put_u32_be(hval + 8, mc);
+	sm_hdr_key(hkey, fileid);
+
+	for (attempt = 0; attempt <= FDB_RETRY_MAX; attempt++) {
+		FDBTransaction *tr = fdb_begin(s->db);
+		fdb_error_t err;
+
+		fdb_transaction_set(tr, hkey, SM_HDR_LEN, hval, SM_HDR_VAL);
+		staged = 0;
+		for (i = 0; i < sc; i++) {
+			uint8_t ekey[SM_ENTRY_LEN];
+			uint8_t ebuf[RONDB_STRIPE_ENTRY_SIZE];
+			if (rondb_stripe_entry_serialize(&entries[i],
+						ebuf, sizeof(ebuf)) < 0) {
+				fdb_transaction_destroy(tr);
+				return MDS_ERR_IO;
+			}
+			sm_entry_key(ekey, fileid, i);
+			fdb_transaction_set(tr, ekey, SM_ENTRY_LEN,
+					ebuf, RONDB_STRIPE_ENTRY_SIZE);
+			staged++;
+		}
+		err = fdb_txn_commit_block(tr);
+		if (err == 0) {
+			fdb_transaction_destroy(tr);
+			break;
+		}
+		if (fdb_commit_maybe_applied(err)) {
+			/* J-03: never re-stage a maybe-committed tx. */
+			fdb_transaction_destroy(tr);
+			return MDS_ERR_DELAY;
+		}
+		fdb_conflict_backoff(tr, err);
+		fdb_transaction_reset(tr);
+		fdb_transaction_destroy(tr);
+		if (attempt == FDB_RETRY_MAX)
+			return MDS_ERR_DELAY; /* G2 spec */
+		(void)staged;
+	}
+	catalog_stat_inc(&cat->stats.authority_writes);
+	return MDS_OK;
+}
+
+static enum mds_status fdb_stripe_map_del(struct mds_catalogue *cat,
+		struct mds_cat_txn *txn, uint64_t fileid)
+{
+	struct fdb_state *s = fdb_state(cat);
+	uint8_t hkey[SM_HDR_LEN], bkey[SM_ENTRY_LEN], ekey[SM_ENTRY_LEN];
+	uint32_t attempt;
+
+	(void)txn;
+	if (s == NULL) return MDS_ERR_INVAL;
+
+	sm_hdr_key(hkey, fileid);
+	sm_entry_key(bkey, fileid, 0);
+	sm_entry_key(ekey, fileid + 1, 0);
+
+	for (attempt = 0; attempt <= FDB_RETRY_MAX; attempt++) {
+		FDBTransaction *tr = fdb_begin(s->db);
+		fdb_error_t err;
+
+		fdb_transaction_clear(tr, hkey, SM_HDR_LEN);
+		fdb_transaction_clear_range(tr, bkey, SM_ENTRY_LEN,
+				ekey, SM_ENTRY_LEN);
+		err = fdb_txn_commit_block(tr);
+		if (err == 0) {
+			fdb_transaction_destroy(tr);
+			break;
+		}
+		if (fdb_commit_maybe_applied(err)) {
+			fdb_transaction_destroy(tr);
+			return MDS_ERR_DELAY;
+		}
+		fdb_conflict_backoff(tr, err);
+		fdb_transaction_reset(tr);
+		fdb_transaction_destroy(tr);
+		if (attempt == FDB_RETRY_MAX)
+			return MDS_ERR_DELAY;
+	}
+	catalog_stat_inc(&cat->stats.authority_writes);
+	return MDS_OK;
+}
+
+/* -----------------------------------------------------------------------
+ * Layout state family (0x50-0x54) -- pNFS LAYOUTGET grant path
+ * (-05 §2.6).  NDB shape (rondb_shim_layout_state_put_once): ONE
+ * transaction over layout_state PK + layout_by_file; ds_layout_idx
+ * rows are a separate best-effort pass and by_client is an
+ * engine-maintained secondary index.  FDB has no engine indexes, so
+ * -05's design makes every index an explicit dual-write; this
+ * implementation writes them all in the SAME transaction (K-5
+ * write-amplification generalisation -- measured, not assumed):
+ *
+ *   0x50 primary     0x50|fileid(8)|stateid(12)
+ *                    -> clientid(8BE)|iomode(4BE)|offset(8BE)|length(8BE)
+ *                       |seqid(4BE)|ds_count(4BE)|ds_ids(4BE each)
+ *   0x51 by_client   0x51|clientid(8)|stateid(12) -> fileid(8BE)
+ *   0x52 by_file     0x52|fileid(8)|stateid(12)   -> clientid(8BE)
+ *   0x53 ds idx      0x53|ds_id(4BE)|clientid(8)|fileid(8) -> stateid(12)
+ *   0x54 by_stateid  0x54|stateid(12) -> fileid(8BE)|clientid(8BE)
+ *
+ * 0x54 is a keyspace REFINEMENT over -05 §1: NDB has the
+ * ix_layout_state_stateid secondary (layout_get_by_stateid resolves
+ * stateid -> (fileid, clientid) without a fileid); -05's prefix table
+ * named by_client/by_file/ds_idx but not the stateid index, so the
+ * slot could not have been implemented as specified.  Registered in
+ * -05 §1 closeout.
+ * ----------------------------------------------------------------------- */
+
+#define LS_KEY_LEN   21
+#define LS_FIXED_VAL 36  /* clientid 8 + iomode 4 + off 8 + len 8 + seq 4 + n 4 */
+
+static void ls_key(uint8_t *k, uint64_t fileid, const uint8_t sid[12])
+{
+	k[0] = 0x50;
+	fdb_put_u64_be(k + 1, fileid);
+	memcpy(k + 9, sid, 12);
+}
+
+static void ls_by_client_key(uint8_t *k, uint64_t clientid,
+			     const uint8_t sid[12])
+{
+	k[0] = 0x51;
+	fdb_put_u64_be(k + 1, clientid);
+	memcpy(k + 9, sid, 12);
+}
+
+static void ls_by_file_key(uint8_t *k, uint64_t fileid,
+			   const uint8_t sid[12])
+{
+	k[0] = 0x52;
+	fdb_put_u64_be(k + 1, fileid);
+	memcpy(k + 9, sid, 12);
+}
+
+static void ls_ds_key(uint8_t *k, uint32_t ds_id, uint64_t clientid,
+		      uint64_t fileid)
+{
+	k[0] = 0x53;
+	fdb_put_u32_be(k + 1, ds_id);
+	fdb_put_u64_be(k + 5, clientid);
+	fdb_put_u64_be(k + 13, fileid);
+}
+
+static void ls_by_stateid_key(uint8_t *k, const uint8_t sid[12])
+{
+	k[0] = 0x54;
+	memcpy(k + 1, sid, 12);
+}
+
+static enum mds_status fdb_layout_grant(struct mds_catalogue *cat,
+		struct mds_cat_txn *txn, uint64_t clientid,
+		uint64_t fileid, uint32_t iomode, uint64_t offset,
+		uint64_t length, const struct nfs4_stateid *stateid,
+		const uint32_t *ds_ids, uint32_t ds_count)
+{
+	struct fdb_state *s = fdb_state(cat);
+	uint8_t k50[LS_KEY_LEN], k51[LS_KEY_LEN], k52[LS_KEY_LEN],
+		k54[13], k53[21], v54[16], val[LS_FIXED_VAL + 4 * 256];
+	uint32_t attempt, i;
+
+	(void)txn;
+	if (s == NULL || stateid == NULL) return MDS_ERR_INVAL;
+	if (ds_count > 0 && ds_ids == NULL) return MDS_ERR_INVAL;
+	if (ds_count > 256) return MDS_ERR_INVAL; /* value buffer bound */
+
+	fdb_put_u64_be(val, clientid);
+	fdb_put_u32_be(val + 8, iomode);
+	fdb_put_u64_be(val + 12, offset);
+	fdb_put_u64_be(val + 20, length);
+	fdb_put_u32_be(val + 28, stateid->seqid);
+	fdb_put_u32_be(val + 32, ds_count);
+	for (i = 0; i < ds_count; i++)
+		fdb_put_u32_be(val + LS_FIXED_VAL + 4 * i, ds_ids[i]);
+
+	ls_key(k50, fileid, stateid->other);
+	ls_by_client_key(k51, clientid, stateid->other);
+	ls_by_file_key(k52, fileid, stateid->other);
+	ls_by_stateid_key(k54, stateid->other);
+	fdb_put_u64_be(v54, fileid);
+	fdb_put_u64_be(v54 + 8, clientid);
+
+	for (attempt = 0; attempt <= FDB_RETRY_MAX; attempt++) {
+		FDBTransaction *tr = fdb_begin(s->db);
+		fdb_error_t err;
+		uint8_t v51[8], v52[8], vprobe[1];
+
+		/* read-before-write on the 0x50 row: the layout stateid
+		 * is an RMW key on renewals; register the read so
+		 * concurrent same-stateid writers conflict and retry. */
+		(void)fdb_txn_get(tr, k50, LS_KEY_LEN, vprobe,
+				sizeof(vprobe));
+		fdb_put_u64_be(v51, fileid);
+		fdb_put_u64_be(v52, clientid);
+		fdb_transaction_set(tr, k50, LS_KEY_LEN,
+				val, LS_FIXED_VAL + 4 * ds_count);
+		fdb_transaction_set(tr, k51, LS_KEY_LEN, v51, 8);
+		fdb_transaction_set(tr, k52, LS_KEY_LEN, v52, 8);
+		fdb_transaction_set(tr, k54, 13, v54, 16);
+		for (i = 0; i < ds_count; i++) {
+			ls_ds_key(k53, ds_ids[i], clientid, fileid);
+			fdb_transaction_set(tr, k53, 21,
+					stateid->other, 12);
+		}
+		err = fdb_txn_commit_block(tr);
+		if (err == 0) {
+			fdb_transaction_destroy(tr);
+			break;
+		}
+		if (fdb_commit_maybe_applied(err)) {
+			fdb_transaction_destroy(tr);
+			return MDS_ERR_DELAY;
+		}
+		fdb_conflict_backoff(tr, err);
+		fdb_transaction_reset(tr);
+		fdb_transaction_destroy(tr);
+		if (attempt == FDB_RETRY_MAX)
+			return MDS_ERR_DELAY;
+	}
+	catalog_stat_inc(&cat->stats.authority_writes);
+	return MDS_OK;
+}
+
+static enum mds_status fdb_layout_get_by_stateid(
+		struct mds_catalogue *cat, const uint8_t sid[12],
+		uint64_t *clientid, uint64_t *fileid, uint32_t *iomode,
+		uint64_t *offset, uint64_t *length, uint32_t *seqid)
+{
+	struct fdb_state *s = fdb_state(cat);
+	uint8_t k54[13], v54[16], k50[LS_KEY_LEN], v50[LS_FIXED_VAL];
+	FDBTransaction *tr;
+	int rc;
+
+	if (s == NULL) return MDS_ERR_INVAL;
+
+	ls_by_stateid_key(k54, sid);
+	tr = fdb_begin(s->db);
+	rc = fdb_txn_get(tr, k54, 13, v54, sizeof(v54));
+	if (rc < 0) {
+		fdb_transaction_destroy(tr);
+		return MDS_ERR_IO;
+	}
+	if (rc != 16) {
+		fdb_transaction_destroy(tr);
+		return MDS_ERR_NOTFOUND;
+	}
+	ls_key(k50, fdb_get_u64_be(v54), sid);
+	rc = fdb_txn_get(tr, k50, LS_KEY_LEN, v50, sizeof(v50));
+	fdb_transaction_destroy(tr);
+	if (rc != LS_FIXED_VAL)
+		return MDS_ERR_NOTFOUND; /* orphan index row */
+	if (clientid) *clientid = fdb_get_u64_be(v54);
+	if (fileid) *fileid = fdb_get_u64_be(v54);
+	if (iomode) *iomode = fdb_get_u32_be(v50 + 8);
+	if (offset) *offset = fdb_get_u64_be(v50 + 12);
+	if (length) *length = fdb_get_u64_be(v50 + 20);
+	if (seqid) *seqid = fdb_get_u32_be(v50 + 28);
+	return MDS_OK;
+}
+
+static enum mds_status fdb_layout_scan_for_file(struct mds_catalogue *cat,
+		uint64_t fileid, bool *has_layout)
+{
+	struct fdb_state *s = fdb_state(cat);
+	uint8_t bkey[LS_KEY_LEN], ekey[LS_KEY_LEN];
+	uint32_t eklen;
+	FDBTransaction *tr;
+	FDBFuture *f;
+	int rc;
+
+	if (s == NULL || has_layout == NULL) return MDS_ERR_INVAL;
+	*has_layout = false;
+
+	/* by_file index: [0x52|fileid|00.., 0x52|(fileid+1)|00..)
+	 * Wrap guard: at max fileid the bound is the next band (0x53). */
+	ls_by_file_key(bkey, fileid, (const uint8_t[12]){0});
+	if (fileid == UINT64_MAX) {
+		ekey[0] = 0x53;
+		eklen = 1;
+	} else {
+		ls_by_file_key(ekey, fileid + 1, (const uint8_t[12]){0});
+		eklen = LS_KEY_LEN;
+	}
+
+	tr = fdb_begin(s->db);
+	f = fdb_transaction_get_range(tr,
+			bkey, LS_KEY_LEN, 0, 1,
+			ekey, eklen, 0, 1,
+			1, 0, FDB_STREAMING_MODE_WANT_ALL, 0, 0, 0);
+	fdb_future_block_until_ready(f);
+	rc = (int)fdb_future_get_error(f);
+	if (rc != 0) {
+		fdb_future_destroy(f);
+		fdb_transaction_destroy(tr);
+		return MDS_ERR_IO;
+	}
+	{
+		int cnt = 0;
+		fdb_bool_t more = 0;
+		fdb_error_t e2 = fdb_future_get_keyvalue_array(f, NULL,
+				&cnt, &more);
+		if (e2 != 0) {
+			fdb_future_destroy(f);
+			fdb_transaction_destroy(tr);
+			return MDS_ERR_IO;
+		}
+		if (cnt > 0)
+			*has_layout = true;
+	}
+	fdb_future_destroy(f);
+	fdb_transaction_destroy(tr);
+	return MDS_OK;
+}
+
+/* -----------------------------------------------------------------------
+ * NFSv4.1 protocol state (0x70/0x71/0x72/0x73) -- SEQUENCE hot path
+ * (-05 §2.6).  The DRC slot write is THE per-request 1-key commit:
+ *
+ *   0x70 sessions       0x70|session_id(16)
+ *                       -> clientid(8BE)|num_slots(4BE)|cb_prog(4BE)
+ *                          |cb_sec(4BE)|owner_mds(4BE)|owner_epoch(8BE)
+ *                          |created_ns(8BE)
+ *   0x71 sess_by_client 0x71|clientid(8)|session_id(16) -> (empty)
+ *   0x72 drc_slots      0x72|session_id(16)|slot_id(4BE)
+ *                       -> seq_id(4BE)|reply_len(4BE)|last_used_ns(8BE)
+ *                          |cached_reply(reply_len)
+ *   0x73 clients        0x73|clientid(8)
+ *                       -> co_len(4BE)|confirmed(1)|owner_mds(4BE)
+ *                          |owner_epoch(8BE)|lease_ns(8BE)|verifier(8)
+ *                          |co_ownerid(co_len)
+ * ----------------------------------------------------------------------- */
+
+#define SESS_KEY_LEN 17
+#define SESS_VAL_LEN 40  /* 8+4+4+4+4+8+8, see session_put */
+
+static void sess_key(uint8_t *k, const uint8_t sid[16])
+{
+	k[0] = 0x70;
+	memcpy(k + 1, sid, 16);
+}
+
+static void sess_by_client_key(uint8_t *k, uint64_t clientid,
+			       const uint8_t sid[16])
+{
+	k[0] = 0x71;
+	fdb_put_u64_be(k + 1, clientid);
+	memcpy(k + 9, sid, 16);
+}
+
+static enum mds_status fdb_session_put(struct mds_catalogue *cat,
+		const struct mds_coord_session_row *row)
+{
+	struct fdb_state *s = fdb_state(cat);
+	uint8_t k70[SESS_KEY_LEN], k71[25], val[SESS_VAL_LEN];
+	uint32_t attempt;
+
+	if (s == NULL || row == NULL) return MDS_ERR_INVAL;
+
+	sess_key(k70, row->session_id);
+	sess_by_client_key(k71, row->clientid, row->session_id);
+	fdb_put_u64_be(val, row->clientid);
+	fdb_put_u32_be(val + 8, row->num_slots);
+	fdb_put_u32_be(val + 12, row->cb_prog);
+	fdb_put_u32_be(val + 16, row->cb_sec_flavor);
+	fdb_put_u32_be(val + 20, row->owner_mds_id);
+	fdb_put_u64_be(val + 24, row->owner_boot_epoch);
+	fdb_put_u64_be(val + 32, row->created_ns);
+
+	for (attempt = 0; attempt <= FDB_RETRY_MAX; attempt++) {
+		FDBTransaction *tr = fdb_begin(s->db);
+		fdb_error_t err;
+
+		fdb_transaction_set(tr, k70, SESS_KEY_LEN,
+				val, SESS_VAL_LEN);
+		/* 0x71 secondary: empty value (index row). */
+		fdb_transaction_set(tr, k71, 25, NULL, 0);
+		err = fdb_txn_commit_block(tr);
+		if (err == 0) {
+			fdb_transaction_destroy(tr);
+			break;
+		}
+		if (fdb_commit_maybe_applied(err)) {
+			fdb_transaction_destroy(tr);
+			return MDS_ERR_DELAY;
+		}
+		fdb_conflict_backoff(tr, err);
+		fdb_transaction_reset(tr);
+		fdb_transaction_destroy(tr);
+		if (attempt == FDB_RETRY_MAX)
+			return MDS_ERR_DELAY;
+	}
+	catalog_stat_inc(&cat->stats.authority_writes);
+	return MDS_OK;
+}
+
+static enum mds_status fdb_session_get(struct mds_catalogue *cat,
+		const uint8_t session_id[16],
+		struct mds_coord_session_row *row)
+{
+	struct fdb_state *s = fdb_state(cat);
+	uint8_t k70[SESS_KEY_LEN], val[SESS_VAL_LEN];
+	FDBTransaction *tr;
+	int rc;
+
+	if (s == NULL || row == NULL) return MDS_ERR_INVAL;
+
+	sess_key(k70, session_id);
+	tr = fdb_begin(s->db);
+	rc = fdb_txn_get(tr, k70, SESS_KEY_LEN, val, sizeof(val));
+	fdb_transaction_destroy(tr);
+	if (rc < 0) return MDS_ERR_IO;
+	if (rc != SESS_VAL_LEN) return MDS_ERR_NOTFOUND;
+
+	memset(row, 0, sizeof(*row));
+	memcpy(row->session_id, session_id, 16);
+	row->clientid = fdb_get_u64_be(val);
+	row->num_slots = fdb_get_u32_be(val + 8);
+	row->cb_prog = fdb_get_u32_be(val + 12);
+	row->cb_sec_flavor = fdb_get_u32_be(val + 16);
+	row->owner_mds_id = fdb_get_u32_be(val + 20);
+	row->owner_boot_epoch = fdb_get_u64_be(val + 24);
+	row->created_ns = fdb_get_u64_be(val + 32);
+	return MDS_OK;
+}
+
+static enum mds_status fdb_session_del(struct mds_catalogue *cat,
+		const uint8_t session_id[16])
+{
+	struct fdb_state *s = fdb_state(cat);
+	uint8_t k70[SESS_KEY_LEN], k71[25], val[SESS_VAL_LEN];
+	uint32_t attempt;
+	int rc;
+
+	if (s == NULL) return MDS_ERR_INVAL;
+
+	/* The 0x71 secondary needs the clientid: cold read first. */
+	sess_key(k70, session_id);
+	rc = fdb_txn_get(fdb_begin(s->db), k70, SESS_KEY_LEN,
+			val, sizeof(val));
+	if (rc < 0) return MDS_ERR_IO;
+	if (rc != SESS_VAL_LEN) return MDS_ERR_NOTFOUND;
+	sess_by_client_key(k71, fdb_get_u64_be(val), session_id);
+
+	for (attempt = 0; attempt <= FDB_RETRY_MAX; attempt++) {
+		FDBTransaction *tr = fdb_begin(s->db);
+		fdb_error_t err;
+
+		fdb_transaction_clear(tr, k70, SESS_KEY_LEN);
+		fdb_transaction_clear(tr, k71, 25);
+		err = fdb_txn_commit_block(tr);
+		if (err == 0) {
+			fdb_transaction_destroy(tr);
+			break;
+		}
+		if (fdb_commit_maybe_applied(err)) {
+			fdb_transaction_destroy(tr);
+			return MDS_ERR_DELAY;
+		}
+		fdb_conflict_backoff(tr, err);
+		fdb_transaction_reset(tr);
+		fdb_transaction_destroy(tr);
+		if (attempt == FDB_RETRY_MAX)
+			return MDS_ERR_DELAY;
+	}
+	catalog_stat_inc(&cat->stats.authority_writes);
+	return MDS_OK;
+}
+
+static enum mds_status fdb_client_put(struct mds_catalogue *cat,
+		const struct mds_coord_client_row *row)
+{
+	struct fdb_state *s = fdb_state(cat);
+	uint8_t k73[9], val[4 + 1 + 4 + 8 + 8 + 8 + 1 + 1024];
+	uint32_t attempt, vlen;
+
+	if (s == NULL || row == NULL) return MDS_ERR_INVAL;
+	if (row->co_ownerid_len > 1024) return MDS_ERR_INVAL;
+
+	k73[0] = 0x73;
+	fdb_put_u64_be(k73 + 1, row->clientid);
+	fdb_put_u32_be(val, row->co_ownerid_len);
+	val[4] = row->confirmed ? 1 : 0;
+	fdb_put_u32_be(val + 5, row->owner_mds_id);
+	fdb_put_u64_be(val + 9, row->owner_boot_epoch);
+	fdb_put_u64_be(val + 17, row->lease_renewed_ns);
+	memcpy(val + 25, row->verifier, 8);
+	memcpy(val + 33, row->co_ownerid, row->co_ownerid_len);
+	vlen = 33 + row->co_ownerid_len;
+
+	for (attempt = 0; attempt <= FDB_RETRY_MAX; attempt++) {
+		FDBTransaction *tr = fdb_begin(s->db);
+		fdb_error_t err;
+
+		fdb_transaction_set(tr, k73, 9, val, vlen);
+		err = fdb_txn_commit_block(tr);
+		if (err == 0) {
+			fdb_transaction_destroy(tr);
+			break;
+		}
+		if (fdb_commit_maybe_applied(err)) {
+			fdb_transaction_destroy(tr);
+			return MDS_ERR_DELAY;
+		}
+		fdb_conflict_backoff(tr, err);
+		fdb_transaction_reset(tr);
+		fdb_transaction_destroy(tr);
+		if (attempt == FDB_RETRY_MAX)
+			return MDS_ERR_DELAY;
+	}
+	catalog_stat_inc(&cat->stats.authority_writes);
+	return MDS_OK;
+}
+
+static enum mds_status fdb_client_get(struct mds_catalogue *cat,
+		uint64_t clientid, struct mds_coord_client_row *row)
+{
+	struct fdb_state *s = fdb_state(cat);
+	uint8_t k73[9], val[4 + 1 + 4 + 8 + 8 + 8 + 8 + 1024];
+	FDBTransaction *tr;
+	int rc;
+
+	if (s == NULL || row == NULL) return MDS_ERR_INVAL;
+
+	k73[0] = 0x73;
+	fdb_put_u64_be(k73 + 1, clientid);
+	tr = fdb_begin(s->db);
+	rc = fdb_txn_get(tr, k73, 9, val, sizeof(val));
+	fdb_transaction_destroy(tr);
+	if (rc < 0) return MDS_ERR_IO;
+	if (rc < 33) return MDS_ERR_NOTFOUND;
+
+	memset(row, 0, sizeof(*row));
+	row->clientid = clientid;
+	row->co_ownerid_len = fdb_get_u32_be(val);
+	if (row->co_ownerid_len > 1024)
+		return MDS_ERR_IO; /* corrupt row */
+	row->confirmed = (val[4] != 0);
+	row->owner_mds_id = fdb_get_u32_be(val + 5);
+	row->owner_boot_epoch = fdb_get_u64_be(val + 9);
+	row->lease_renewed_ns = fdb_get_u64_be(val + 17);
+	memcpy(row->verifier, val + 25, 8);
+	memcpy(row->co_ownerid, val + 33, row->co_ownerid_len);
+	return MDS_OK;
+}
+
+static enum mds_status fdb_client_del(struct mds_catalogue *cat,
+		uint64_t clientid)
+{
+	struct fdb_state *s = fdb_state(cat);
+	uint8_t k73[9];
+	uint32_t attempt;
+
+	if (s == NULL) return MDS_ERR_INVAL;
+
+	k73[0] = 0x73;
+	fdb_put_u64_be(k73 + 1, clientid);
+	for (attempt = 0; attempt <= FDB_RETRY_MAX; attempt++) {
+		FDBTransaction *tr = fdb_begin(s->db);
+		fdb_error_t err;
+
+		fdb_transaction_clear(tr, k73, 9);
+		err = fdb_txn_commit_block(tr);
+		if (err == 0) {
+			fdb_transaction_destroy(tr);
+			break;
+		}
+		if (fdb_commit_maybe_applied(err)) {
+			fdb_transaction_destroy(tr);
+			return MDS_ERR_DELAY;
+		}
+		fdb_conflict_backoff(tr, err);
+		fdb_transaction_reset(tr);
+		fdb_transaction_destroy(tr);
+		if (attempt == FDB_RETRY_MAX)
+			return MDS_ERR_DELAY;
+	}
+	catalog_stat_inc(&cat->stats.authority_writes);
+	return MDS_OK;
+}
+
+static enum mds_status fdb_slot_put(struct mds_catalogue *cat,
+		const uint8_t session_id[16], uint32_t slot_id,
+		uint32_t seq_id, const void *cached_reply,
+		uint32_t reply_len)
+{
+	struct fdb_state *s = fdb_state(cat);
+	uint8_t k72[21], val[16 + 256 * 1024];
+	uint64_t now_ns;
+	struct timespec ts;
+	uint32_t attempt, vlen;
+
+	if (s == NULL) return MDS_ERR_INVAL;
+	if (reply_len > 256 * 1024) return MDS_ERR_INVAL;
+	if (reply_len > 0 && cached_reply == NULL) return MDS_ERR_INVAL;
+
+	/* THE per-request SEQUENCE commit: one 0x72 key write
+	 * (-05 §2.6).  2.3ms commit latency (H-03) enters P50. */
+	k72[0] = 0x72;
+	memcpy(k72 + 1, session_id, 16);
+	fdb_put_u32_be(k72 + 17, slot_id);
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+	fdb_put_u32_be(val, seq_id);
+	fdb_put_u32_be(val + 4, reply_len);
+	fdb_put_u64_be(val + 8, now_ns);
+	if (reply_len > 0)
+		memcpy(val + 16, cached_reply, reply_len);
+	vlen = 16 + reply_len;
+
+	for (attempt = 0; attempt <= FDB_RETRY_MAX; attempt++) {
+		FDBTransaction *tr = fdb_begin(s->db);
+		fdb_error_t err;
+		uint8_t probe[1];
+
+		/* read-before-write (RMW hot key): FDB only conflicts a
+		 * transaction against keys it READ, so the slot put must
+		 * touch its key in-transaction or concurrent same-slot
+		 * writers would both commit and lose a seq_id. */
+		(void)fdb_txn_get(tr, k72, 21, probe, sizeof(probe));
+		fdb_transaction_set(tr, k72, 21, val, vlen);
+		err = fdb_txn_commit_block(tr);
+		if (err == 0) {
+			fdb_transaction_destroy(tr);
+			break;
+		}
+		if (fdb_commit_maybe_applied(err)) {
+			fdb_transaction_destroy(tr);
+			return MDS_ERR_DELAY;
+		}
+		fdb_conflict_backoff(tr, err);
+		fdb_transaction_reset(tr);
+		fdb_transaction_destroy(tr);
+		if (attempt == FDB_RETRY_MAX)
+			return MDS_ERR_DELAY;
+	}
+	catalog_stat_inc(&cat->stats.authority_writes);
+	return MDS_OK;
+}
+
+static enum mds_status fdb_slot_get(struct mds_catalogue *cat,
+		const uint8_t session_id[16], uint32_t slot_id,
+		struct mds_coord_drc_slot_row *row)
+{
+	struct fdb_state *s = fdb_state(cat);
+	uint8_t k72[21], val[16 + 256 * 1024];
+	FDBTransaction *tr;
+	uint32_t rlen;
+	int rc;
+
+	if (s == NULL || row == NULL) return MDS_ERR_INVAL;
+
+	k72[0] = 0x72;
+	memcpy(k72 + 1, session_id, 16);
+	fdb_put_u32_be(k72 + 17, slot_id);
+	tr = fdb_begin(s->db);
+	rc = fdb_txn_get(tr, k72, 21, val, sizeof(val));
+	fdb_transaction_destroy(tr);
+	if (rc < 0) return MDS_ERR_IO;
+	if (rc < 16) return MDS_ERR_NOTFOUND;
+
+	rlen = fdb_get_u32_be(val + 4);
+	if ((uint32_t)rc < 16 + rlen)
+		return MDS_ERR_IO; /* corrupt row */
+	memset(row, 0, sizeof(*row));
+	memcpy(row->session_id, session_id, 16);
+	row->slot_id = slot_id;
+	row->seq_id = fdb_get_u32_be(val);
+	row->reply_len = rlen;
+	row->last_used_ns = fdb_get_u64_be(val + 8);
+	row->cached_reply = NULL;
+	if (rlen > 0) {
+		row->cached_reply = malloc(rlen);
+		if (row->cached_reply == NULL)
+			return MDS_ERR_NOMEM;
+		memcpy(row->cached_reply, val + 16, rlen);
+	}
+	return MDS_OK;
+}
+
+/* Only the six vertical-slice slots + the layout/protocol-state
+ * families are filled.  Everything else stays NULL -> MDS_ERR_NOSUPPORT
+ * -> NFS4ERR_NOTSUPP (G1). */
+static const struct mds_authority_ops fdb_authority_ops = {
+	.ns_create = fdb_ns_create,
+	.ns_remove = fdb_ns_remove,
+	.ns_lookup = fdb_ns_lookup,
+	.ns_getattr = fdb_ns_getattr,
+	.ns_setattr = fdb_ns_setattr,
+	.ns_readdir = fdb_ns_readdir,
+	.stripe_map_get = fdb_stripe_map_get,
+	.stripe_map_put = fdb_stripe_map_put,
+	.stripe_map_del = fdb_stripe_map_del,
+};
+
+/* Coordination vtable: layout state + NFSv4.1 protocol state.  The
+ * journal/open/lock/delegation/recovery slots stay NULL -> NOSUPPORT
+ * (rename 2PC + shared-attr subsystems are slice-external; K-4). */
+static const struct mds_coordination_ops fdb_coordination_ops = {
+	.layout_grant = fdb_layout_grant,
+	.layout_get_by_stateid = fdb_layout_get_by_stateid,
+	.layout_scan_for_file = fdb_layout_scan_for_file,
+	.client_put = fdb_client_put,
+	.client_get = fdb_client_get,
+	.client_del = fdb_client_del,
+	.session_put = fdb_session_put,
+	.session_get = fdb_session_get,
+	.session_del = fdb_session_del,
+	.slot_put = fdb_slot_put,
+	.slot_get = fdb_slot_get,
+};
+
+/* -----------------------------------------------------------------------
  * Lifecycle
  * ----------------------------------------------------------------------- */
 
@@ -935,17 +1814,6 @@ static enum mds_status fdb_probe_backend(struct mds_catalogue *cat)
 static const struct mds_catalogue_ops fdb_catalogue_ops = {
 	.close = fdb_close_backend,
 	.probe = fdb_probe_backend,
-};
-
-/* Only the six vertical-slice slots are filled.  Everything else stays
- * NULL -> MDS_ERR_NOSUPPORT -> NFS4ERR_NOTSUPP (G1). */
-static const struct mds_authority_ops fdb_authority_ops = {
-	.ns_create = fdb_ns_create,
-	.ns_remove = fdb_ns_remove,
-	.ns_lookup = fdb_ns_lookup,
-	.ns_getattr = fdb_ns_getattr,
-	.ns_setattr = fdb_ns_setattr,
-	.ns_readdir = fdb_ns_readdir,
 };
 
 /* Ensure the root inode (fileid 2) + its NL/CHG counters exist;
@@ -1008,9 +1876,11 @@ enum mds_status catalogue_fdb_wipe(struct mds_catalogue *cat)
 {
 	struct fdb_state *s = fdb_state(cat);
 	uint8_t b0[1] = {0x00}, e0[1] = {0x01};
-	uint8_t b1[1] = {0x10}, e1[1] = {0x11};
-	uint8_t b2[1] = {0x20}, e2[1] = {0x21};
-	uint8_t b3[1] = {0x21}, e3[1] = {0x22};
+	uint8_t b1[1] = {0x10}, e1[1] = {0x20};
+	uint8_t b2[1] = {0x20}, e2[1] = {0x30};
+	uint8_t b3[1] = {0x30}, e3[1] = {0x50};
+	uint8_t b4[1] = {0x50}, e4[1] = {0x70};
+	uint8_t b5[1] = {0x70}, e5[1] = {0x80};
 	FDBTransaction *tr;
 	fdb_error_t e;
 
@@ -1020,6 +1890,8 @@ enum mds_status catalogue_fdb_wipe(struct mds_catalogue *cat)
 	fdb_transaction_clear_range(tr, b1, 1, e1, 1);
 	fdb_transaction_clear_range(tr, b2, 1, e2, 1);
 	fdb_transaction_clear_range(tr, b3, 1, e3, 1);
+	fdb_transaction_clear_range(tr, b4, 1, e4, 1);
+	fdb_transaction_clear_range(tr, b5, 1, e5, 1);
 	e = fdb_txn_commit_block(tr);
 	fdb_transaction_destroy(tr);
 	if (e != 0) return MDS_ERR_IO;
@@ -1090,7 +1962,7 @@ enum mds_status catalogue_fdb_open(const struct mds_config *cfg,
 
 	cat->backend = MDS_BACKEND_FDB;
 	cat->auth_ops = &fdb_authority_ops;
-	cat->coord_ops = NULL; /* coordination slots: NOSUPPORT in slice */
+	cat->coord_ops = &fdb_coordination_ops;
 	cat->ops = &fdb_catalogue_ops;
 	cat->backend_private = s;
 	*out = cat;

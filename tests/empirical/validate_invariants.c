@@ -3,9 +3,11 @@
  * (docs/fdb-feasibility-02 §B, spec lines 131-146).
  *
  * Scans the FDB slice keyspaces (0x00 counters / 0x10 inodes /
- * 0x20 dirents / 0x21 child index) and reports PASS/FAIL + violation
- * samples (first 5) + counts per invariant.  STRICTLY READ-ONLY:
- * only get / get_range are issued, nothing is ever staged.
+ * 0x20 dirents / 0x21 child index / 0x30-0x31 stripe maps /
+ * 0x50-0x54 layout state / 0x70-0x73 protocol state) and reports
+ * PASS/FAIL + violation samples (first 5) + counts per invariant.
+ * STRICTLY READ-ONLY: only get / get_range are issued, nothing is
+ * ever staged.
  *
  * Slice-applicable invariants:
  *   I-1  create atomicity : every 0x20 dirent resolves to an existing
@@ -21,13 +23,25 @@
  *   I-5  fileid uniqueness: 0x10 keys carry no duplicates; every fileid
  *                            in use <= FID counter (monotonic, no
  *                            reuse); counter present
+ *   I-6  layout/stripe refs: 0x30 header sc matches 0x31 entry count
+ *                            and ordinals 0..sc-1; no orphan 0x31
+ *                            entry; every 0x50 layout row cross-checked
+ *                            against 0x51/0x52/0x54 index rows and back
+ *                            (no orphan 0x54); 0x53 ds rows close to a
+ *                            0x52 index row
+ *   I-7  protocol state   : every 0x70 session has a 0x71 client index
+ *                            row + a 0x73 client row; every 0x71 index
+ *                            row points at a live 0x70 session; 0x72
+ *                            slot and 0x73 client rows well-formed.
+ *                            No slot->session closure: schema has no
+ *                            cascade (matches NDB drc_slots), so slots
+ *                            outlive their session by design
  *   I-9  no orphan inodes  : every 0x10 inode (except root fid 2) is
  *                            referenced by >= 1 dirent; 0x21 dual-write
  *                            set == 0x20 (parent,child) set
  *
  * SKIPPED (outside the slice / unimplemented slots):
- *   I-3 rename (G1/NOSUPPORT), I-6 layout, I-7 protocol state,
- *   I-8 queue claim.
+ *   I-3 rename (G1/NOSUPPORT), I-8 queue claim.
  *
  * Exit: 0 = all PASS, 1 = at least one FAIL, 2 = environment error.
  *
@@ -194,15 +208,15 @@ struct viol {
 	int total;
 	char sample[SAMPLES][160];
 };
-static struct viol g_v[6];
+static struct viol g_v[8];
 
 static struct viol *gv(const char *inv)
 {
 	int i;
-	for (i = 0; i < 6; i++)
+	for (i = 0; i < 8; i++)
 		if (g_v[i].used && strcmp(g_v[i].inv, inv) == 0)
 			return &g_v[i];
-	for (i = 0; i < 6; i++)
+	for (i = 0; i < 8; i++)
 		if (!g_v[i].used) {
 			g_v[i].used = 1;
 			g_v[i].inv = inv;
@@ -243,6 +257,73 @@ static int cmp_pair(const void *a, const void *b)
 	if (p->parent != q->parent)
 		return (p->parent > q->parent) - (p->parent < q->parent);
 	return (p->child > q->child) - (p->child < q->child);
+}
+
+/* ------------------------------------------------------------------ */
+/* I-6 / I-7 state: stripe map + layout state + protocol state        */
+/* keyspaces added by the C-12/K-3 increment (catalogue_fdb.c)        */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+	uint64_t fileid;
+	uint64_t clientid;
+	uint8_t  sid[12];
+} lsrow_t;
+
+typedef struct {
+	uint64_t fileid;
+	uint8_t  sid[12];
+} ls53_t;
+
+typedef struct {
+	uint64_t clientid;
+	uint8_t  sess[16];
+} sessrow_t;
+
+static pair_t   g_sm30[MAXT];     /* (fileid, sc)          */
+static long     g_nsm30 = 0;
+static uint64_t g_sm30_fid[MAXT]; /* fileids w/ a header   */
+static long     g_nsm30f = 0;
+static int      g_sm31_hdr_ready = 0; /* orphan check phase */
+static int      g_ord[128];       /* per-file entry ordinals */
+static long     g_nord = 0;
+static lsrow_t  g_ls50[MAXT];     /* 0x50 layout rows      */
+static long     g_nls50 = 0;
+static lsrow_t  g_ls54[MAXT];     /* 0x54 reverse index    */
+static long     g_nls54 = 0;
+static ls53_t   g_ls53[MAXT];     /* 0x53 ds rows          */
+static long     g_nls53 = 0;
+static sessrow_t g_se70[MAXT];    /* 0x70 sessions         */
+static long     g_nse70 = 0;
+static sessrow_t g_se71[MAXT];    /* 0x71 client index     */
+static long     g_nse71 = 0;
+static long     g_slot_bad = 0;   /* 0x72 well-formedness  */
+static long     g_cli_bad = 0;    /* 0x73 well-formedness  */
+
+static void put_be64(uint8_t *p, uint64_t v)
+{
+	int i;
+	for (i = 0; i < 8; i++)
+		p[i] = (uint8_t)(v >> (8 * (7 - i)));
+}
+
+/* exists? 1 = present (any value length, incl. empty), 0 = absent,
+ * -1 = error.  rget() cannot distinguish an empty value from
+ * absence, so the 0x71 empty-value index rows need this. */
+static int rexists(FDBTransaction *tr, const uint8_t *key, int klen)
+{
+	FDBFuture *f = fdb_transaction_get(tr, key, klen, 0);
+	fdb_future_block_until_ready(f);
+	int rc = -1;
+	if (fdb_future_get_error(f) == 0) {
+		fdb_bool_t p = 0;
+		const uint8_t *v = NULL;
+		int vl = 0;
+		if (fdb_future_get_value(f, &p, &v, &vl) == 0)
+			rc = p ? 1 : 0;
+	}
+	fdb_future_destroy(f);
+	return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -311,6 +392,177 @@ static int cb_x21(const FDBKeyValue *kv, void *arg)
 	return 0;
 }
 
+/* ---- I-6 / I-7 scan callbacks ---- */
+
+static int cb_sm30(const FDBKeyValue *kv, void *arg)
+{
+	uint32_t sc;
+	(void)arg;
+	if (kv->key_length != 9 || kv->value_length != 12) {
+		viol("I-6", "malformed 0x30 header (klen=%d vlen=%d)",
+		     kv->key_length, kv->value_length);
+		return 0;
+	}
+	sc = (uint32_t)(be64(kv->value) >> 32); /* sc is BE32 at [0..4) */
+	if (g_nsm30 < MAXT) {
+		g_sm30[g_nsm30].parent = be64(kv->key + 1);
+		g_sm30[g_nsm30].child  = sc;
+		g_nsm30++;
+	}
+	if (g_nsm30f < MAXT)
+		g_sm30_fid[g_nsm30f++] = be64(kv->key + 1);
+	return 0;
+}
+
+static int cb_sm31(const FDBKeyValue *kv, void *arg)
+{
+	uint64_t fid;
+	(void)arg;
+	if (kv->key_length != 11) {
+		viol("I-6", "malformed 0x31 entry key (len %d != 11)",
+		     kv->key_length);
+		return 0;
+	}
+	fid = be64(kv->key + 1);
+	if (g_sm31_hdr_ready &&
+	    lin_find(g_sm30_fid, g_nsm30f, fid) < 0)
+		viol("I-6", "0x31 entry fid=%llu has no 0x30 header "
+		     "(orphan stripe entry)", (unsigned long long)fid);
+	return 0;
+}
+
+/* per-file 0x31 ordinal collector (I-6a range scan) */
+static int cb_smord(const FDBKeyValue *kv, void *arg)
+{
+	(void)arg;
+	if (kv->key_length != 11)
+		viol("I-6", "0x31 entry key len %d != 11", kv->key_length);
+	if (g_nord < 128)
+		g_ord[g_nord] = (kv->key[9] << 8) | kv->key[10];
+	g_nord++;
+	return 0;
+}
+
+static int cb_ls50(const FDBKeyValue *kv, void *arg)
+{
+	(void)arg;
+	if (kv->key_length != 21 || kv->value_length < 36) {
+		viol("I-6", "malformed 0x50 row (klen=%d vlen=%d)",
+		     kv->key_length, kv->value_length);
+		return 0;
+	}
+	if (g_nls50 < MAXT) {
+		g_ls50[g_nls50].fileid  = be64(kv->key + 1);
+		g_ls50[g_nls50].clientid = be64(kv->value);
+		memcpy(g_ls50[g_nls50].sid, kv->key + 9, 12);
+		g_nls50++;
+	}
+	return 0;
+}
+
+static int cb_ls54(const FDBKeyValue *kv, void *arg)
+{
+	(void)arg;
+	if (kv->key_length != 13 || kv->value_length != 16) {
+		viol("I-6", "malformed 0x54 row (klen=%d vlen=%d)",
+		     kv->key_length, kv->value_length);
+		return 0;
+	}
+	if (g_nls54 < MAXT) {
+		g_ls54[g_nls54].fileid  = be64(kv->value);
+		g_ls54[g_nls54].clientid = be64(kv->value + 8);
+		memcpy(g_ls54[g_nls54].sid, kv->key + 1, 12);
+		g_nls54++;
+	}
+	return 0;
+}
+
+static int cb_ls53(const FDBKeyValue *kv, void *arg)
+{
+	(void)arg;
+	if (kv->key_length != 21 || kv->value_length != 12) {
+		viol("I-6", "malformed 0x53 row (klen=%d vlen=%d)",
+		     kv->key_length, kv->value_length);
+		return 0;
+	}
+	if (g_nls53 < MAXT) {
+		g_ls53[g_nls53].fileid = be64(kv->key + 13);
+		memcpy(g_ls53[g_nls53].sid, kv->value, 12);
+		g_nls53++;
+	}
+	return 0;
+}
+
+static int cb_se70(const FDBKeyValue *kv, void *arg)
+{
+	(void)arg;
+	if (kv->key_length != 17 || kv->value_length != 40) {
+		viol("I-7", "malformed 0x70 session (klen=%d vlen=%d)",
+		     kv->key_length, kv->value_length);
+		return 0;
+	}
+	if (g_nse70 < MAXT) {
+		g_se70[g_nse70].clientid = be64(kv->value);
+		memcpy(g_se70[g_nse70].sess, kv->key + 1, 16);
+		g_nse70++;
+	}
+	return 0;
+}
+
+static int cb_se71(const FDBKeyValue *kv, void *arg)
+{
+	(void)arg;
+	if (kv->key_length != 25) {
+		viol("I-7", "malformed 0x71 index (klen=%d != 25)",
+		     kv->key_length);
+		return 0;
+	}
+	if (g_nse71 < MAXT) {
+		g_se71[g_nse71].clientid = be64(kv->key + 1);
+		memcpy(g_se71[g_nse71].sess, kv->key + 9, 16);
+		g_nse71++;
+	}
+	return 0;
+}
+
+static int cb_slot72(const FDBKeyValue *kv, void *arg)
+{
+	uint32_t rlen;
+	(void)arg;
+	if (kv->key_length != 21 || kv->value_length < 16) {
+		g_slot_bad++;
+		viol("I-7", "malformed 0x72 slot (klen=%d vlen=%d)",
+		     kv->key_length, kv->value_length);
+		return 0;
+	}
+	rlen = (uint32_t)(be64(kv->value + 4) >> 32);
+	if (16 + rlen != (uint32_t)kv->value_length) {
+		g_slot_bad++;
+		viol("I-7", "0x72 slot rlen=%u inconsistent with "
+		     "vlen=%d", rlen, kv->value_length);
+	}
+	return 0;
+}
+
+static int cb_cli73(const FDBKeyValue *kv, void *arg)
+{
+	uint32_t olen;
+	(void)arg;
+	if (kv->key_length != 9 || kv->value_length < 33) {
+		g_cli_bad++;
+		viol("I-7", "malformed 0x73 client (klen=%d vlen=%d)",
+		     kv->key_length, kv->value_length);
+		return 0;
+	}
+	olen = (uint32_t)(be64(kv->value) >> 32);
+	if (33 + olen != (uint32_t)kv->value_length) {
+		g_cli_bad++;
+		viol("I-7", "0x73 client olen=%u inconsistent with "
+		     "vlen=%d", olen, kv->value_length);
+	}
+	return 0;
+}
+
 /* per-parent: count directory children (point-read the child's
  * 0x10 row, type byte at wire offset 8 -- rondb_inode_serialize:
  * fileid(8) then type(1)).  Read-only. */
@@ -358,15 +610,44 @@ int main(int argc, char **argv)
 		uint8_t b10[1] = {0x10}, e10[1] = {0x11};
 		uint8_t b20[1] = {0x20}, e20[1] = {0x21};
 		uint8_t b21[1] = {0x21}, e21[1] = {0x22};
-		if (rscan(tr, b10, 1, e10, 1, cb_inode, NULL, &n10) ||
+		uint8_t b30[1] = {0x30}, e30[1] = {0x31};
+		uint8_t b31[1] = {0x31}, e31[1] = {0x32};
+		uint8_t b50[1] = {0x50}, e50[1] = {0x53};
+		uint8_t b53[1] = {0x53}, e53[1] = {0x54};
+		uint8_t b54[1] = {0x54}, e54[1] = {0x55};
+		uint8_t b70[1] = {0x70}, e70[1] = {0x71};
+		uint8_t b71[1] = {0x71}, e71[1] = {0x72};
+		uint8_t b72[1] = {0x72}, e72[1] = {0x73};
+		uint8_t b73[1] = {0x73}, e73[1] = {0x74};
+		long n30 = 0, n31 = 0, n50 = 0, n53 = 0, n54 = 0;
+		long n70 = 0, n71 = 0, n72 = 0, n73 = 0;
+		int serr =
+		    rscan(tr, b10, 1, e10, 1, cb_inode, NULL, &n10) ||
 		    rscan(tr, b20, 1, e20, 1, cb_dirent, NULL, &n20) ||
-		    rscan(tr, b21, 1, e21, 1, cb_x21, NULL, &n21)) {
+		    rscan(tr, b21, 1, e21, 1, cb_x21, NULL, &n21) ||
+		    rscan(tr, b30, 1, e30, 1, cb_sm30, NULL, &n30);
+		g_sm31_hdr_ready = 1; /* 0x31 orphan checks armed */
+		serr |=
+		    rscan(tr, b31, 1, e31, 1, cb_sm31, NULL, &n31) ||
+		    rscan(tr, b50, 1, e50, 1, cb_ls50, NULL, &n50) ||
+		    rscan(tr, b53, 1, e53, 1, cb_ls53, NULL, &n53) ||
+		    rscan(tr, b54, 1, e54, 1, cb_ls54, NULL, &n54) ||
+		    rscan(tr, b70, 1, e70, 1, cb_se70, NULL, &n70) ||
+		    rscan(tr, b71, 1, e71, 1, cb_se71, NULL, &n71) ||
+		    rscan(tr, b72, 1, e72, 1, cb_slot72, NULL, &n72) ||
+		    rscan(tr, b73, 1, e73, 1, cb_cli73, NULL, &n73);
+		if (serr) {
 			printf("scan error\n");
 			return 2;
 		}
+		printf("scanned: %ld inodes, %ld dirents, %ld index rows\n",
+		       n10, n20, n21);
+		printf("scanned: %ld stripe hdrs, %ld stripe entries, "
+		       "%ld layout rows, %ld ds rows, %ld rev-idx rows\n",
+		       n30, n31, n50, n53, n54);
+		printf("scanned: %ld sessions, %ld sess-idx rows, "
+		       "%ld slots, %ld clients\n\n", n70, n71, n72, n73);
 	}
-	printf("scanned: %ld inodes, %ld dirents, %ld index rows\n\n",
-	       n10, n20, n21);
 
 	/* ---- I-1/I-2: closure dirent -> inode ---- */
 	{
@@ -548,11 +829,198 @@ int main(int argc, char **argv)
 	}
 
 	printf("I-3 rename atomicity: SKIPPED (unimplemented, G1/NOSUPPORT)\n");
-	printf("I-6 layout refs: SKIPPED (keyspace not in slice)\n");
-	printf("I-7 protocol state: SKIPPED (keyspace not in slice)\n");
 	printf("I-8 queue claim: SKIPPED (keyspace not in slice)\n");
 
-	for (i = 0; i < 6; i++) {
+	/* ---- I-6: layout/stripe reference closure ---- */
+	{
+		int bad = 0;
+		long i6;
+
+		/* I-6a: every 0x30 header (sc>0) has exactly sc 0x31
+		 * entries with ordinals exactly 0..sc-1 */
+		for (i6 = 0; i6 < g_nsm30; i6++) {
+			uint64_t fid = g_sm30[i6].parent;
+			uint32_t sc = (uint32_t)g_sm30[i6].child;
+			uint8_t b[11], e[11];
+			long n = 0;
+			int ok, o, j;
+
+			if (sc == 0)
+				continue; /* single-stripe inline: no 0x31 */
+			if (sc > 128) {
+				bad++;
+				viol("I-6", "file %llu: sc=%u > 128 (corrupt header)",
+				     (unsigned long long)fid, sc);
+				continue;
+			}
+			b[0] = 0x31;
+			put_be64(b + 1, fid);
+			b[9] = b[10] = 0;
+			if (fid == UINT64_MAX) {
+				e[0] = 0x32; /* next key band */
+			} else {
+				e[0] = 0x31;
+				put_be64(e + 1, fid + 1);
+				e[9] = e[10] = 0;
+			}
+			g_nord = 0;
+			if (rscan(tr, b, 11, e, fid == UINT64_MAX ? 1 : 11,
+				  cb_smord, NULL, &n) ||
+			    n != (long)sc) {
+				bad++;
+				viol("I-6", "file %llu: sc=%u but %ld 0x31 entries",
+				     (unsigned long long)fid, sc, n);
+				continue;
+			}
+			ok = 1;
+			for (o = 0; o < (int)sc && ok; o++) {
+				for (j = 0; j < g_nord; j++)
+					if (g_ord[j] == o)
+						break;
+				if (j == g_nord)
+					ok = 0;
+			}
+			if (!ok) {
+				bad++;
+				viol("I-6", "file %llu: sc=%u ordinal gap/dup",
+				     (unsigned long long)fid, sc);
+			}
+		}
+
+		/* I-6c: every 0x50 row <-> 0x51/0x52/0x54 cross-check */
+		for (i6 = 0; i6 < g_nls50; i6++) {
+			lsrow_t *r = &g_ls50[i6];
+			uint8_t k54[13], k51[21], k52[21], v[16];
+			int rc;
+
+			k54[0] = 0x54;
+			memcpy(k54 + 1, r->sid, 12);
+			rc = rget(tr, k54, 13, v, 16);
+			if (rc != 16 || be64(v) != r->fileid ||
+			    be64(v + 8) != r->clientid) {
+				bad++;
+				viol("I-6",
+				     "0x50 (fid=%llu cid=%llu) 0x54 reverse missing/mismatch",
+				     (unsigned long long)r->fileid,
+				     (unsigned long long)r->clientid);
+			}
+			k51[0] = 0x51;
+			put_be64(k51 + 1, r->clientid);
+			memcpy(k51 + 9, r->sid, 12);
+			if (rget(tr, k51, 21, v, 8) != 8 ||
+			    be64(v) != r->fileid) {
+				bad++;
+				viol("I-6",
+				     "0x50 (fid=%llu cid=%llu) 0x51 by-client missing/mismatch",
+				     (unsigned long long)r->fileid,
+				     (unsigned long long)r->clientid);
+			}
+			k52[0] = 0x52;
+			put_be64(k52 + 1, r->fileid);
+			memcpy(k52 + 9, r->sid, 12);
+			if (rget(tr, k52, 21, v, 8) != 8 ||
+			    be64(v) != r->clientid) {
+				bad++;
+				viol("I-6",
+				     "0x50 (fid=%llu cid=%llu) 0x52 by-file missing/mismatch",
+				     (unsigned long long)r->fileid,
+				     (unsigned long long)r->clientid);
+			}
+		}
+
+		/* I-6d: every 0x54 reverse row closes to a 0x50 row */
+		for (i6 = 0; i6 < g_nls54; i6++) {
+			lsrow_t *r = &g_ls54[i6];
+			uint8_t k50[21], v[36];
+			k50[0] = 0x50;
+			put_be64(k50 + 1, r->fileid);
+			memcpy(k50 + 9, r->sid, 12);
+			if (rget(tr, k50, 21, v, 36) < 36) {
+				bad++;
+				viol("I-6",
+				     "0x54 (fid=%llu cid=%llu) orphan: no 0x50 row",
+				     (unsigned long long)r->fileid,
+				     (unsigned long long)r->clientid);
+			}
+		}
+
+		/* I-6e: every 0x53 ds row closes to a 0x52 index row */
+		for (i6 = 0; i6 < g_nls53; i6++) {
+			uint8_t k52[21], v[8];
+			k52[0] = 0x52;
+			put_be64(k52 + 1, g_ls53[i6].fileid);
+			memcpy(k52 + 9, g_ls53[i6].sid, 12);
+			if (rget(tr, k52, 21, v, 8) != 8) {
+				bad++;
+				viol("I-6",
+				     "0x53 ds row fid=%llu stateid=%02x.. has no 0x52 index",
+				     (unsigned long long)g_ls53[i6].fileid,
+				     g_ls53[i6].sid[0]);
+			}
+		}
+
+		if (bad == 0)
+			printf("I-6 stripe/layout refs: PASS (%ld hdrs, "
+			       "%ld layout rows, %ld ds rows, %ld rev rows)\n",
+			       g_nsm30, g_nls50, g_nls53, g_nls54);
+		else {
+			printf("I-6 layout refs: FAIL (%d violations)\n", bad);
+			fail = 1;
+		}
+	}
+
+	/* ---- I-7: protocol state consistency ---- */
+	{
+		int bad = 0;
+		long i7;
+
+		for (i7 = 0; i7 < g_nse70; i7++) {
+			sessrow_t *r = &g_se70[i7];
+			uint8_t k71[25], k73[9], v[40];
+
+			k71[0] = 0x71;
+			put_be64(k71 + 1, r->clientid);
+			memcpy(k71 + 9, r->sess, 16);
+			if (rexists(tr, k71, 25) != 1) {
+				bad++;
+				viol("I-7",
+				     "0x70 session (cid=%llu) has no 0x71 client index row",
+				     (unsigned long long)r->clientid);
+			}
+			k73[0] = 0x73;
+			put_be64(k73 + 1, r->clientid);
+			if (rget(tr, k73, 9, v, 40) < 33) {
+				bad++;
+				viol("I-7",
+				     "0x70 session references missing 0x73 client cid=%llu",
+				     (unsigned long long)r->clientid);
+			}
+		}
+		for (i7 = 0; i7 < g_nse71; i7++) {
+			uint8_t k70[17], v[40];
+			k70[0] = 0x70;
+			memcpy(k70 + 1, g_se71[i7].sess, 16);
+			if (rget(tr, k70, 17, v, 40) != 40) {
+				bad++;
+				viol("I-7",
+				     "0x71 index row (cid=%llu) points at missing 0x70 session",
+				     (unsigned long long)g_se71[i7].clientid);
+			}
+		}
+
+		if (bad == 0 && g_slot_bad == 0 && g_cli_bad == 0)
+			printf("I-7 protocol state: PASS (%ld sessions, "
+			       "%ld index rows, slots/clients well-formed)\n",
+			       g_nse70, g_nse71);
+		else {
+			printf("I-7 protocol state: FAIL (closure=%d "
+			       "slot_bad=%ld cli_bad=%ld)\n",
+			       bad, g_slot_bad, g_cli_bad);
+			fail = 1;
+		}
+	}
+
+	for (i = 0; i < 8; i++) {
 		int s;
 		if (g_v[i].used && g_v[i].total > 0) {
 			printf("\n%s violations: %d total, first %d:\n",

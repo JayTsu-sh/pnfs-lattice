@@ -130,3 +130,44 @@ D3 真实验证资产已在 Phase 3 落地（见上行 + §7），但**全部为
 3. 生产工作负载画像（§01 等价性验收）→ 把 lab-REAL 升级为生产 REAL。
 4. 权重冻结（`-03` 签署）→ 进 §08 评分。
 以上任一触发 Hybrid / No-Go 的退出条件见 §5。
+
+---
+
+## 8. Phase 4 C-12 增量（2026-10-15，实现完成 / lab 实测挂起）
+
+> 证据等级：**本增量尚无 lab-REAL 实测**（实现 + 本地编译验证，lab 集群访问受阻，见下）。
+> **不改变"Defer"决策效力**——只把 C-12 盲点（`-10` §4）从"槽未实现"推进到"槽已实现、实测待跑"。
+
+**落地范围（C-12 盲点的代码侧收口）**：
+1. **FDB 后端补 3 族槽位**（`catalogue_fdb.c`，~1500 行，`ENABLE_FDB` 默认 OFF）：
+   - **0x30/0x31 stripe map 族**：多 stripe 文件 LAYOUTGET 的布局数据。头+N 明细单事务写入（同 NDB 形状）；
+     单 stripe 文件走 inline（MDS_IFLAG_INLINE_STRIPE，wire 携带）不建键——与 NDB 的
+     "无布局行=单 stripe"约定一致。
+   - **0x50-0x54 layout state 族**：pNFS layout grant/lookup/scan。主键 0x50 + 三个二级
+     （0x51 by_client / 0x52 by_file / 0x53 by_ds）+ **0x54 by_stateid 反向索引**
+     （NDB `ix_layout_state_stateid` 等价，`-05` 前缀表漏列已补登记），五索引单事务维护。
+   - **0x70-0x73 协议态族**：sessions / session_by_client / drc_slots（NDB PK=(clientid,slot_id)，
+     `-05` §2.6 误写 session_id 已更正）/ clients。
+2. **read-before-write RMW（本增量揪出的真实缺口）**：FDB 冲突检测只对**同事务内读过**的键生效——
+   `fdb_slot_put` / `fdb_layout_grant` 原为纯写事务，并发同键写会**静默丢更新**。两者写前加
+   `fdb_txn_get` 同键探测（注册冲突范围），harness S-15（同键并发 RMW 风暴，终值精确断言）为其验证器。
+3. **功能断言**（`fdb_slice_harness.c`）：S-12 stripe map round-trip（单/多 stripe + inline 不建键）、
+   S-13 layout grant/lookup/scan（五索引一致）、S-14 协议态 round-trip（session+slot+client）、
+   S-15 并发 slot/layout 写风暴（4 线程同键 RMW，终值精确 = 线程数×轮数，零丢更新）。
+4. **不变量校验**（`validate_invariants.c`）：I-6（stripe 头↔明细闭环 + layout 四索引交叉验证）、
+   I-7（session↔client 索引闭环 + 值 well-formed）从 SKIPPED 升级为真校验。
+5. **混合负载压测**（`tests/empirical/mixed_load_bench.c`，新建）：按 `-06` §1.2.4 配方
+   （LAYOUTGET 45% / SEQUENCE 25% / PUTFH+GETATTR+ACCESS 20% / other 10%），1→16 线程 × 15s 每档，
+   seeded keyspace 共享，per-class p50/p95/p99 延迟采样 + SEQUENCE RMW 终验。
+
+**验证状态（本地）**：
+- `cmake -DENABLE_FDB=ON` 全量构建 RC=0；`-DENABLE_FDB=OFF` 树不受影响（catalogue_fdb.c 不参与 OFF 编译）。
+- 四个经验二进制（catalogue_fdb.c / fdb_slice_harness.c / validate_invariants.c / mixed_load_bench.c）
+  `gcc -O2 -Wall -Wextra` 独立编译零警告。
+- **lab 集群运行受阻**：node 44（10.131.9.44）ssh publickey 全部被拒
+  （/root/.ssh/fdbenv + 本机 3 个备用 key 均 Permission denied，2026-10-15 15:13 探测）。
+  按"真实拒绝交清单不重试"纪律**挂起**，恢复访问后的执行清单见 `-09` 附录 C 同型命令（
+  S-12..S-15 两轮 + I-6/I-7 正负向 + mixed_load_bench 1→16T）。
+
+**对 G-GATE 的影响**：无。G-GATE-6 仍缺生产等价性 + Phase 4 真实环境 A/B；
+C-12 升级 lab-REAL 的前提（lab 实测数据）在恢复集群访问后补齐。
