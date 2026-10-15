@@ -31,9 +31,9 @@
 | E-3 | 现有错误路径两个真实缺陷：G1（NOSUPPORT→SERVERFAULT 漂移）、G2（重试耗尽→IO 终态而非 DELAY） | REFERENCE（代码确认） | `-02` §A.3 | FDB 后端实现前**必须**修复，否则直接触发 G-GATE-4（错误码漂移/未知提交无法对账） |
 
 **关键缺口（阻塞评分，按权重排序）**：
-- SLO/验收线未登记（§01 "必须提前量化"）——权重最高的 3 个维度（性能 15% + 正确性 20% + 一致性 18% 的通过线）无法定义。
-- 生产工作负载画像缺失（`-06` §3）——所有 lab 数字只能标"预验证"。
-- FDB 后端代码为零——114 槽 vtable 无一槽在 FDB 上跑过。
+- SLO/验收线未登记（§01 "必须提前量化"）——权重最高的 3 个维度（性能 15% + 正确性 20% + 一致性 18% 的通过线）无法定义。**Phase 3 后仍缺**（见 §7）。
+- 生产工作负载画像缺失（`-06` §3）——所有 lab 数字只能标"预验证"。**Phase 3 后仍缺**（Phase 3 用 lab 集群产出的是 **lab-REAL**，非生产 REAL）。
+- ~~FDB 后端代码为零~~ ——**已消减**：Phase 3 落地 6 槽垂直切片（`catalogue_fdb.c`，`ENABLE_FDB` 开关），node 44 真实 3 节点集群 harness 28/28（见 §7）。authority 71 槽中的 6 槽已 REAL 化，其余槽仍为切片外（G1/NOSUPPORT）。
 
 ## 4. 残余风险与责任人（`-03` §4 决策点 4 指定裁决人后激活）
 
@@ -76,5 +76,55 @@
 | `docs/fdb-feasibility-06-workload-profile.md` | wire-level 操作混合 + conformance 基线 + 压测配方 | D1 工作负载画像（lab 半） |
 | `docs/fdb-feasibility-07-migration-design.md` | 四路线评估 + M-2 证伪 + 回滚设计 | D6 迁移 |
 | `tests/empirical/fdb_bench.c` | FDB 7.4 C API 微基准（micro/create/unlink/counter） | D3 验证资产（部分） |
+| `docs/fdb-feasibility-09-phase3-engineering.md` | Phase 3 工程实现：6 槽切片 + atomic_op 热路径 + validator + 9 注入测试 + K-1..K-9 实测（lab-REAL） | D3 验证资产（Phase 3 收官） |
+| `src/catalogue/catalogue_fdb.c` + `tests/empirical/fdb_{slice_harness,validate_invariants,injection_tests,hotdir_bench}.c` | FDB 后端 6 槽实现 + 可复现实测 harness/validator/注入/压测 | D3 真实验证资产（lab-REAL） |
 
-**D3 真实验证资产 / D4 性能容量报告 / D5 可靠性运维**：Phase 3/4 产物，当前为空（如实登记，不代填）。
+**D4 性能容量报告 / D5 可靠性运维**：Phase 4 产物，当前为空（如实登记，不代填）。
+D3 真实验证资产已在 Phase 3 落地（见上行 + §7），但**全部为 lab-REAL**（node 44 实验室集群），
+生产 REAL 仍待 §01 等价性验收 + Phase 4 真实环境 A/B。
+
+---
+
+## 7. Phase 3 工程实现增量（2026-10-15，lab-REAL 证据）
+
+> 证据等级：**lab-REAL**（node 44 真实 3 节点 FDB 7.4.8 集群，可复现命令见 `-09`）。
+> 非生产 REAL——G-GATE-6 仍要求生产等价性验收（§01）+ Phase 4 真实环境 A/B，
+> **本增量不改变"Defer"决策效力，只把 Phase 3 退出条件的第 1-5 步证据补齐**。
+> 完整工程细节（键布局、11 个真 bug、逐 K 判定）见 `docs/fdb-feasibility-09-phase3-engineering.md`。
+
+**落地范围（§5 的 5 步全收口）**：
+1. G1/G2 前置 fix：done（NOSUPPORT→NFS4ERR 映射 + 重试耗尽→DELAY）。
+2. 6 槽垂直切片：`catalogue_fdb.c`（~1100 行，`ENABLE_FDB` 默认 OFF，本地 66 项 ctest 不受影响），
+   node 44 harness **28/28 两轮**（create/lookup/getattr/setattr/remove/readdir+分页/EXISTS 预检/
+   200 连发/二次 open/4×25 并发 S-11/文件删除父 nlink S-7d）。
+3. `validate_invariants`（I-1/2/4/5/9，只读）：**首战即抓真 bug B-4**（remove 文件误减父 NL，
+   与 create 的 +0 不对称，对照 RonDB 925-926 修）；负向注入精确触发 I-1/I-5/I-9；正向 ALL PASS。
+4. 9 注入测试（`-04` §3 切片子集）：J-01/J-03/J-06 实测 **9/9 两轮**；6 项 SKIPPED 注明原因。
+   **J-03 揪出 1021 盲重放缺口并修**：库把 commit_unknown_result 当可重试（文档一致），
+   create/remove 遇 1021 绝不重放→DELAY；claim 可重放（最多浪费 1024 号窗，不重发号）。
+5. K-1..K-9 逐条实测（`fdb_hotdir_bench.c`，真实 ns_create 路径，热父目录）：
+   - **K-1 通过**：热父 1→16 线程 324→3162 ops/s 近线性 9.8x，**无 H-01 的 374→369 平顶冲突墙**，
+     父 CHG 精确 +6400（无丢失更新）。真实 create 吞吐锚点从"冲突 bound"上移到
+     **提交延迟 bound**；约为 RonDB shared 16T（23k）的 14%，差距=17x 提交延迟（H-03），与冲突无关。
+   - **K-8 通过待 SLO**：p99 3.7→8.55ms 亚线性、无 H-01 的 122-175ms 墙、无悬崖；
+     p999 16T 33.6ms（良性批认领尾）。合规性待 SLO 登记后按 p99 8.5ms 判。
+   - **K-5 量化关闭**：0x21 双写 ~28B/op（~8% 写字节），FDB 无索引为有序性的代价，可忽略。
+   - **K-7 确认关闭**：285B inode value = 0.28% 告警阈值；trace 零值大小告警零 Warning，6400 连发稳定。
+   - **K-2/K-3/K-4/K-9 DEFERRED**（切片外子系统，非失败）：队列分片/sessions 每请求提交/
+     rename TOCTOU/跨 MDS 2PC 对账——各需切片外子系统落地才能实测，转入 Phase 4 / 决策项。
+     **K-4 仍是唯一未触碰的正确性红线（G-GATE-1）**，路线 A/B 未拍板（`-05` §6 建议 A 保底）。
+
+**对 §4 残余风险表的影响**：
+- "热键冲突墙"（E-1/H-01）→ **lab 实测消减**：atomic_op 计数器设计在真实 create 路径上
+  16 线程无冲突墙（K-1）。
+- "G1/G2 错误语义缺陷" → **已修**（E-3 闭环）。
+- "K-3 SEQUENCE SLO" → 仍待 SLO 登记；K-8 的 p99 8.55ms 提供了第一个 lab 锚点。
+- "K-4 rename TOCTOU" → **未消减**（切片外，仍为最高风险，需路线拍板 + Phase 4 故障注入）。
+- "迁移不可逆点 / 生产等价性 / 权重未冻结 / 无 FDB 值守" → 无变化（Phase 4 / 治理项）。
+
+**下一步（决策方输入）**：
+1. 登记 SLO → 把 K-8 的 p99 8.55ms / 提交延迟 2.3ms 落到合规判定（§3 E-2 解锁）。
+2. 拍板 K-4 rename 路线（A 保底 vs B 激进）——当前唯一未消减的结构风险。
+3. 生产工作负载画像（§01 等价性验收）→ 把 lab-REAL 升级为生产 REAL。
+4. 权重冻结（`-03` 签署）→ 进 §08 评分。
+以上任一触发 Hybrid / No-Go 的退出条件见 §5。
