@@ -78,6 +78,8 @@
 | `tests/empirical/fdb_bench.c` | FDB 7.4 C API 微基准（micro/create/unlink/counter） | D3 验证资产（部分） |
 | `docs/fdb-feasibility-09-phase3-engineering.md` | Phase 3 工程实现：6 槽切片 + atomic_op 热路径 + validator + 9 注入测试 + K-1..K-9 实测（lab-REAL） | D3 验证资产（Phase 3 收官） |
 | `src/catalogue/catalogue_fdb.c` + `tests/empirical/fdb_{slice_harness,validate_invariants,injection_tests,hotdir_bench}.c` | FDB 后端 6 槽实现 + 可复现实测 harness/validator/注入/压测 | D3 真实验证资产（lab-REAL） |
+| `docs/fdb-feasibility-10-backend-comparison.md` | RonDB vs FDB 结构级优缺点比较：12 维总表（逐行证据等级）+ 三个结构性事实 + 5 项比较盲点显式登记；不代判评分（G-GATE-6） | §08 决策输入（结构解释载体） |
+| `tests/empirical/results/fdb/` | Phase 3 结果归档（`-02` §B.3 manifest 约定：manifest.json + README） | D3 归档纪律 |
 
 **D4 性能容量报告 / D5 可靠性运维**：Phase 4 产物，当前为空（如实登记，不代填）。
 D3 真实验证资产已在 Phase 3 落地（见上行 + §7），但**全部为 lab-REAL**（node 44 实验室集群），
