@@ -1,0 +1,17 @@
+== validate_invariants (FDB slice, read-only) ==
+cluster: /etc/foundationdb/fdb.cluster
+
+scanned: 66 inodes, 65 dirents, 65 index rows
+scanned: 64 stripe hdrs, 256 stripe entries, 64 layout rows, 128 layout-idx rows, 128 ds rows, 64 rev-idx rows
+scanned: 16 sessions, 16 sess-idx rows, 64 slots, 16 clients
+
+I-1/I-2 dirent->inode closure: PASS (65 dirents, no dangling)
+I-4 NL == 2 + dir_children: PASS (2 parents)
+I-5 fileid unique + monotonic: PASS (counter=32770, 66 fids, dup_samples=0)
+I-9 orphans=0, 0x21 dual-write set equal: PASS
+I-3 rename atomicity: SKIPPED (unimplemented, G1/NOSUPPORT)
+I-8 queue claim: SKIPPED (keyspace not in slice)
+I-6 stripe/layout refs: PASS (64 hdrs, 64 layout rows, 128 ds rows, 64 rev rows)
+I-7 protocol state: PASS (16 sessions, 16 index rows, slots/clients well-formed)
+
+== ALL PASS ==

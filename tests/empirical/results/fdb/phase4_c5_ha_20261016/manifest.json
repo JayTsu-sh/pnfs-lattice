@@ -40,7 +40,7 @@
   },
   "finding": {
     "ha": "3-node triple cluster losing 1 node -> stuck 'recruiting_transaction_servers', available=false, no completed recovery while node down (>3 min observed). Node restored -> 3/3 available, data intact. A minimal 3-node cluster is NOT continuously available at 2/3; production FDB HA needs more nodes / multi-region.",
-    "i7_note": "I-7 invariants FAIL is a separate pre-existing mixed_load_bench seed-completeness gap (16 sessions seeded without 0x73 client rows), independent of the node failure; follow-up to fix in the bench seed."
+    "i7_note": "I-7 invariants FAIL is a separate pre-existing mixed_load_bench seed-completeness gap (16 sessions seeded without 0x73 client rows), independent of the node failure. FIXED 2026-10-16: seed now creates the 0x73 client rows (client_put) before session_put; re-run confirms the bench keyspace passes ALL invariants (I-7 PASS, == ALL PASS ==). See phase4_c12_20261016/{mixed_load_bench,validate_invariants}_i7fix_rerun-2026-10-16.log."
   },
   "gate_input": "G-GATE-6 D5 reliability input (FDB HA/recovery, was 零实测)"
 }

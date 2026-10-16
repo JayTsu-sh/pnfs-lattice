@@ -12,9 +12,11 @@
   "raw_paths": [
     "phase4-c12-slice-harness-2026-10-16.log（fdb_slice_harness S-12..S-15 61/61 PASS，RC=0；S-15 单事务 RMW slot 风暴终值 seq=100、renewal 风暴终值 seqid=40，零丢更新）",
     "phase4-c12-validate-invariants-2026-10-16.log（validate_invariants I-6（含 I-6f 0x51/0x52↔0x50 子校验）/I-7 ALL PASS，RC=0；扫 3 layout 行/6 layout-idx/2 ds/3 rev-idx/1 session/1 client）",
-    "phase4-c12-mixed-load-bench-2026-10-16.log（mixed_load_bench 1→16T RC=0；1T 精确 sum=1725 ok=1725；吞吐 1T=461→2T=911→4T=1705→8T=2940→16T=4634 ops/s；N>1T 跨事务 API 对 TOCTOU 丢失 690/39909=1.73%）"
+    "phase4-c12-mixed-load-bench-2026-10-16.log（mixed_load_bench 1→16T RC=0；1T 精确 sum=1725 ok=1725；吞吐 1T=461→2T=911→4T=1705→8T=2940→16T=4634 ops/s；N>1T 跨事务 API 对 TOCTOU 丢失 690/39909=1.73%）",
+    "mixed_load_bench_i7fix_rerun-2026-10-16.log（I-7 种子修复后重跑：seed 补 client_put → 'seeded: 64 files, 16 sessions, 16 clients'；1T 精确 sum=1523 ok=1523；吞吐 1T=405→2T=803→4T=1534→8T=2733→16T=4307 ops/s；TOCTOU 丢失 480）",
+    "validate_invariants_i7fix_rerun-2026-10-16.log（I-7 修复后重跑：scanned 16 sessions/16 sess-idx/64 slots/16 clients，I-7 PASS，== ALL PASS == RC=0）"
   ],
   "operator": "xiaonan.he（Hermes agent 协助）",
   "timestamp": "2026-10-16",
-  "notes": "C-12 盲点（`-10` §4）lab-REAL 填数。S-15 单事务 RMW 验证'同键并发写零丢更新'性质本身；mixed_load_bench 沿用跨事务 API 对（对齐内核 drc_slot 续期的真实调用形状），N>1T TOCTOU 丢失 690/39909=1.73% 作为**数据**上报（量化'内核续期路径必须单事务 RMW'，单事务 RMW 零丢失已由 S-15 lab 实证），丢失量非失败判据。TOCTOU 丢失量为并发时序相关，逐 run 波动（本次 690，首次 run 494）。commit 57ba769 = C-12 全部代码定稿（S-15 单事务 RMW + mixed_load_bench TOCTOU 数据化 + I-6f + catalogue_fdb.c 两处 buffer bug 修复）。"
+  "notes": "C-12 盲点（`-10` §4）lab-REAL 填数。S-15 单事务 RMW 验证'同键并发写零丢更新'性质本身；mixed_load_bench 沿用跨事务 API 对（对齐内核 drc_slot 续期的真实调用形状），N>1T TOCTOU 丢失 690/39909=1.73% 作为**数据**上报（量化'内核续期路径必须单事务 RMW'，单事务 RMW 零丢失已由 S-15 lab 实证），丢失量非失败判据。TOCTOU 丢失量为并发时序相关，逐 run 波动（本次 690，首次 run 494）。commit 57ba769 = C-12 全部代码定稿（S-15 单事务 RMW + mixed_load_bench TOCTOU 数据化 + I-6f + catalogue_fdb.c 两处 buffer bug 修复）。另（2026-10-16）发现 mixed_load_bench **种子缺口**：seed 建 16 个 0x70 session 未建对应 0x73 client（`session_put` 无 `client_put`、且先 `catalogue_fdb_wipe`）→ C-5 故障注入后跑 validate_invariants 才暴露 I-7 FAIL（**非数据丢失**，真实不变量全 PASS）。修复=seed 补 `client_put`（commit 见 git log）；重跑确认 bench keyspace 现通过全部不变量（I-7 PASS、== ALL PASS ==），重跑样本 1T 精确 1523/1523、16T 4307 ops/s、TOCTOU 480（逐 run 波动，findings 不变）。"
 }

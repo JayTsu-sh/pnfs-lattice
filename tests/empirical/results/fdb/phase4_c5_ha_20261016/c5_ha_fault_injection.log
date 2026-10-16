@@ -109,4 +109,7 @@ RESULT
    production FDB HA needs more nodes / multi-region so the transaction-log group can re-form
    without the failed node. A 3-node footprint optimizes capacity, not availability-during-failure.
 4. I-7 invariants FAIL is a SEPARATE pre-existing mixed_load_bench seed gap (sessions w/o clients),
-   not a C-5 / data-loss event — to be fixed in the bench seed (follow-up, C-12 side).
+   not a C-5 / data-loss event. **FIXED 2026-10-16**: seed now does client_put for each session
+   (clientid 5000+i) before session_put; re-run confirms the bench keyspace passes ALL invariants
+   (I-7 PASS, == ALL PASS ==, RC=0). See phase4_c12_20261016/{mixed_load_bench,validate_invariants}
+   _i7fix_rerun-2026-10-16.log.

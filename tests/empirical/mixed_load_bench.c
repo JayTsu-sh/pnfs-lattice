@@ -375,7 +375,25 @@ int main(int argc, char **argv)
 		memcpy(g_seed[f].sid_other, sid.other, 12);
 	}
 	for (t = 0; t < NS; t++) {
+		struct mds_coord_client_row cl;
 		struct mds_coord_session_row ss;
+
+		/* client first (NFSv4 SETCLIENTID precedes CREATESESSION) so
+		 * every seeded 0x70 session has a 0x73 client row -- keeps the
+		 * seeded keyspace I-7-consistent (validate_invariants would
+		 * otherwise flag 16 sessions referencing missing clients). */
+		memset(&cl, 0, sizeof(cl));
+		cl.clientid = 5000 + t;
+		cl.co_ownerid_len = 4;
+		memcpy(cl.co_ownerid, "test", 4);
+		memset(cl.verifier, (uint8_t)(5000 + t), 8);
+		cl.confirmed = true;
+		st = cat->coord_ops->client_put(cat, &cl);
+		if (st != MDS_OK) {
+			printf("seed client %d put failed st=%d\n", t,
+			       (int)st);
+			return 2;
+		}
 
 		memset(&ss, 0, sizeof(ss));
 		for (j = 0; j < 8; j++)
@@ -393,7 +411,8 @@ int main(int argc, char **argv)
 		}
 		memcpy(g_sess_id_arr[t], ss.session_id, 16);
 	}
-	printf("seeded: %d files, %d sessions\n\n", NSF, NS);
+	printf("seeded: %d files, %d sessions, %d clients\n\n",
+	       NSF, NS, NS);
 
 	/* ---- stage sweep ---- */
 	for (t = 0; t < nstages; t++) {
