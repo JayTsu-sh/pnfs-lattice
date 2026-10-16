@@ -191,6 +191,12 @@ D3 真实验证资产已在 Phase 3 落地（见上行 + §7），但**全部为
     （无并发零丢）；吞吐近线性 1T=461 → 2T=911 → 4T=1705 → 8T=2940 → 16T=4634 ops/s；**N>1T 跨事务
     API 对 TOCTOU 丢失 690/39909 SEQ ops（1.73%）**——量化"内核 drc_slot 续期必须单事务 RMW"（S-15
     已 lab 实证单事务 RMW 零丢失），丢失量为数据非失败判据。
+- **mixed_load_bench 种子 I-7 缺口修复（2026-10-16）**：C-5 故障注入后跑 validate_invariants 才暴露
+  seed 建 16 个 0x70 session 未建对应 0x73 client（`session_put` 无 `client_put`、且先
+  `catalogue_fdb_wipe`）→ I-7 FAIL（**非数据丢失**，真实不变量全 PASS）。修复=seed 补 `client_put`
+  （NFSv4 SETCLIENTID 先于 CREATESESSION）；重跑确认 bench keyspace 现通过**全部不变量**（I-7 PASS、
+  == ALL PASS == RC=0），重跑样本 1T 精确 1523/1523、16T 4307 ops/s、TOCTOU 480（逐 run 波动，
+  findings 不变）。raw 归档 `phase4_c12_20261016/{mixed_load_bench,validate_invariants}_i7fix_rerun-2026-10-16.log`。
 
 **对 G-GATE 的影响**：C-12 盲点从"槽未实现"推进到**"槽已实现 + lab-REAL 实测通过"**（G-GATE-6 的
 lab 前提已满足）。仍缺生产等价性验收（§01）+ Phase 4 真实环境 A/B——故**不改变"Defer"决策效力**，
@@ -237,7 +243,8 @@ Fault Tolerance=1 machine without data loss。（603 节点对称复测未做—
 - **数据完整性**：validate_invariants 真实不变量 I-1/I-2/I-4/I-5/I-6/I-9 全 PASS（数据尺寸前后
   一致）；I-7 FAIL 系 **mixed_load_bench 种子缺口**（seed 建 16 个 0x70 session 未建对应
   0x73 client——`session_put` 无 `client_put`、且先 `catalogue_fdb_wipe`），**与节点故障无关、
-  非数据丢失**，属 C-12 bench 种子待修项（follow-up）。
+  非数据丢失**，属 C-12 bench 种子缺口——**已修（2026-10-16）**：seed 补 `client_put`，重跑确认
+  bench keyspace 通过全部不变量（I-7 PASS、== ALL PASS ==，见 `-08` §8 / `phase4_c12_20261016/*_i7fix_rerun`）。
 
 **含义（解释；机制=2/3 下 TX-server 招募卡住）**：极简 3 节点 FDB 集群**非 2/3 持续可用**——丢 1
 节点会卡在"招募事务服务器"、不可用（观测窗口 >3 min 未恢复）。生产 FDB HA 需**更多节点/多区域**，
