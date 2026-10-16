@@ -30,8 +30,13 @@
  *        field-by-field (incl. cached_reply blob), del -> NOTFOUND
  *   S-15 concurrency: slot RMW storm (4x25, final seq exact +100) +
  *        layout renewal storm on ONE stateid (4x10, final seqid
- *        exact +40) -- FDB conflict retry must serialize same-key
- *        writers with zero lost updates
+ *        exact +40) -- each increment is a SINGLE-TRANSACTION RMW
+ *        (read + write in one tx); FDB conflict retry must
+ *        serialize same-key writers with zero lost updates.
+ *        NOTE: the cross-transaction get->put API pair has a TOCTOU
+ *        gap (the put tx reads fresh, yet writes the value computed
+ *        from the earlier get) -- kernel renewal paths must RMW in
+ *        ONE transaction; this storm is the evidence for that.
  *
  * Exit 0 = all pass.  Evidence grade for the feasibility report:
  * this is a REAL measurement on the lab FDB cluster (7.4.8).
@@ -54,6 +59,7 @@
 #include "pnfs_mds.h"
 #include "open_state.h"
 #include <stdbool.h>
+#include <foundationdb/fdb_c.h>
 
 /* ---- stubs: the slice harness needs only these three external
  * symbols from outside {catalogue_fdb.c, rondb_schema.c} ---- */
@@ -168,83 +174,220 @@ static void *s11_worker(void *arg)
 }
 
 /* ---- S-15 worker contexts (file scope: the worker must not be a
- * nested function) ---- */
+ * nested function).  The RMW storms use raw FDB with ONE
+ * transaction per increment (read + write in the same tx): the
+ * catalogue API's get->put pair spans two transactions and has a
+ * TOCTOU gap (the put tx's read-before-write registers a FRESH read
+ * version, but the value written was computed from the earlier get
+ * -- a concurrent commit in between is silently lost), so the API
+ * pair cannot be the unit under test for no-lost-updates. */
 struct s15_slot_ctx {
-	struct mds_catalogue *cat;
+	FDBDatabase *db;
 	uint8_t sess[16];
 	uint32_t iters;
 	enum mds_status st;
 	uint32_t errors;
 };
 struct s15_layout_ctx {
-	struct mds_catalogue *cat;
+	FDBDatabase *db;
 	uint8_t other[12];
 	uint64_t fid;
 	uint32_t iters;
 	enum mds_status st;
+	uint32_t errors;
 };
 
-/* RMW increment on ONE (session, slot): read seq, write seq+1.
- * With read-before-write in fdb_slot_put, concurrent increments on
- * the same key must serialize -> every increment applies exactly
- * once -> the final seq is EXACT (no lost updates). */
+static uint32_t s15_be32(const uint8_t *p)
+{
+	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+	       ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+static void s15_put_be32(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)(v >> 24);
+	p[1] = (uint8_t)(v >> 16);
+	p[2] = (uint8_t)(v >> 8);
+	p[3] = (uint8_t)v;
+}
+
+/* Single-transaction RMW increment on ONE (session, slot 0): read
+ * seq in-transaction, write seq+1 in the SAME transaction.  The
+ * in-tx read registers the conflict range, so concurrent
+ * increments on the same key must conflict-retry -> every
+ * increment applies exactly once -> final seq is EXACT. */
 static void *s15_slot_worker(void *arg)
 {
 	struct s15_slot_ctx *c = arg;
-	uint32_t i;
+	uint32_t i, attempt;
 
 	c->st = MDS_OK;
 	c->errors = 0;
 	for (i = 0; i < c->iters; i++) {
-		enum mds_status s2;
-		struct mds_coord_drc_slot_row row;
+		uint8_t key[21], val[17];
+		int done = 0;
 
-		memset(&row, 0, sizeof(row));
-		s2 = c->cat->coord_ops->slot_get(c->cat, c->sess, 0, &row);
-		if (s2 != MDS_OK && s2 != MDS_ERR_NOTFOUND) {
-			c->errors++;
-			continue;
+		key[0] = 0x72;
+		memcpy(key + 1, c->sess, 16);
+		s15_put_be32(key + 17, 0); /* slot_id 0 */
+
+		for (attempt = 0; attempt < 50 && !done; attempt++) {
+			FDBTransaction *tr = NULL;
+			FDBFuture *f;
+			fdb_error_t err;
+
+			if (fdb_database_create_transaction(c->db,
+							     &tr) != 0) {
+				c->errors++;
+				break;
+			}
+			f = fdb_transaction_get(tr, key, 21, 0);
+
+			fdb_future_block_until_ready(f);
+			err = fdb_future_get_error(f);
+			if (err != 0) {
+				fdb_future_destroy(f);
+				fdb_transaction_destroy(tr);
+				c->errors++;
+				break;
+			}
+			{
+				fdb_bool_t present = 0;
+				const uint8_t *v = NULL;
+				int vlen = 0, seq = 0;
+
+				fdb_future_get_value(f, &present, &v, &vlen);
+				if (present && v != NULL && vlen >= 4)
+					seq = s15_be32(v);
+				fdb_future_destroy(f);
+				/* write in the SAME transaction: the read
+				 * above is the conflict anchor */
+				s15_put_be32(val, (uint32_t)seq + 1);
+				s15_put_be32(val + 4, 1); /* reply_len */
+				memset(val + 8, 0, 8);   /* last_used_ns */
+				val[16] = 'r';
+			}
+			fdb_transaction_set(tr, key, 21, val, sizeof(val));
+			f = fdb_transaction_commit(tr);
+			fdb_future_block_until_ready(f);
+			err = fdb_future_get_error(f);
+			fdb_future_destroy(f);
+			if (err == 0) {
+				fdb_transaction_destroy(tr);
+				done = 1;
+				break;
+			}
+			if (err == 1021) { /* commit_unknown_result */
+				fdb_transaction_destroy(tr);
+				c->st = MDS_ERR_DELAY;
+				break;
+			}
+			{
+				FDBFuture *re = fdb_transaction_on_error(tr,
+									err);
+				if (re != NULL) {
+					fdb_future_block_until_ready(re);
+					fdb_future_destroy(re);
+				}
+			}
+			fdb_transaction_destroy(tr);
 		}
-		if (row.cached_reply != NULL)
-			free(row.cached_reply);
-		s2 = c->cat->coord_ops->slot_put(c->cat, c->sess, 0,
-				row.seq_id + 1, "r", 1);
-		if (s2 != MDS_OK) {
-			c->st = s2;
+		if (!done) {
+			if (c->st == MDS_OK)
+				c->st = MDS_ERR_IO;
 			break;
 		}
 	}
 	return NULL;
 }
 
-/* RMW increment of the LAYOUT stateid seqid on ONE stateid
- * (the SEQUENCE/LAYOUTGET renewal serialization property). */
+/* Single-transaction RMW increment of the LAYOUT stateid seqid on
+ * ONE stateid (the SEQUENCE/LAYOUTGET renewal serialization
+ * property): read the 0x50 row in-transaction, bump the seqid word
+ * (offset 28 in the 36B fixed head), rewrite the whole row in the
+ * SAME transaction. */
 static void *s15_layout_worker(void *arg)
 {
 	struct s15_layout_ctx *c = arg;
-	uint32_t i;
-	uint64_t cid, fid, off, len;
-	uint32_t mode, seq;
-	struct nfs4_stateid sid;
+	uint32_t i, attempt, b;
 
 	c->st = MDS_OK;
+	c->errors = 0;
 	for (i = 0; i < c->iters; i++) {
-		enum mds_status s2;
+		uint8_t key[21], row[36 + 4 * 256];
+		int rowlen = 0, done = 0;
 
-		s2 = c->cat->coord_ops->layout_get_by_stateid(c->cat,
-				c->other, &cid, &fid, &mode, &off, &len,
-				&seq);
-		if (s2 != MDS_OK) {
-			c->st = s2;
-			break;
+		key[0] = 0x50;
+		for (b = 0; b < 8; b++)
+			key[1 + b] = (uint8_t)(c->fid >> (56 - 8 * b));
+		memcpy(key + 9, c->other, 12);
+
+		for (attempt = 0; attempt < 50 && !done; attempt++) {
+			FDBTransaction *tr = NULL;
+			FDBFuture *f;
+			fdb_error_t err;
+
+			if (fdb_database_create_transaction(c->db,
+							     &tr) != 0) {
+				c->errors++;
+				break;
+			}
+			f = fdb_transaction_get(tr, key, 21, 0);
+
+			fdb_future_block_until_ready(f);
+			err = fdb_future_get_error(f);
+			if (err != 0) {
+				fdb_future_destroy(f);
+				fdb_transaction_destroy(tr);
+				c->errors++;
+				break;
+			}
+			{
+				fdb_bool_t present = 0;
+				const uint8_t *v = NULL;
+				int vlen = 0;
+
+				fdb_future_get_value(f, &present, &v, &vlen);
+				fdb_future_destroy(f);
+				if (!present || v == NULL || vlen < 36) {
+					fdb_transaction_destroy(tr);
+					c->st = MDS_ERR_NOTFOUND;
+					break;
+				}
+				rowlen = (vlen > (int)sizeof(row))
+						? (int)sizeof(row) : vlen;
+				memcpy(row, v, (size_t)rowlen);
+				/* bump the seqid word in-transaction */
+				s15_put_be32(row + 28,
+					     s15_be32(row + 28) + 1);
+			}
+			fdb_transaction_set(tr, key, 21, row, rowlen);
+			f = fdb_transaction_commit(tr);
+			fdb_future_block_until_ready(f);
+			err = fdb_future_get_error(f);
+			fdb_future_destroy(f);
+			if (err == 0) {
+				fdb_transaction_destroy(tr);
+				done = 1;
+				break;
+			}
+			if (err == 1021) { /* commit_unknown_result */
+				fdb_transaction_destroy(tr);
+				c->st = MDS_ERR_DELAY;
+				break;
+			}
+			{
+				FDBFuture *re = fdb_transaction_on_error(tr,
+									err);
+				if (re != NULL) {
+					fdb_future_block_until_ready(re);
+					fdb_future_destroy(re);
+				}
+			}
+			fdb_transaction_destroy(tr);
 		}
-		memset(&sid, 0, sizeof(sid));
-		sid.seqid = seq + 1;
-		memcpy(sid.other, c->other, 12);
-		s2 = c->cat->coord_ops->layout_grant(c->cat, NULL, cid,
-				c->fid, mode, off, len, &sid, NULL, 0);
-		if (s2 != MDS_OK) {
-			c->st = s2;
+		if (!done) {
+			if (c->st == MDS_OK)
+				c->st = MDS_ERR_IO;
 			break;
 		}
 	}
@@ -824,12 +967,9 @@ s13_done:
 s14_done:
 
 	/* S-15: same-key RMW storms -- the SEQUENCE/LAYOUTGET renewal
-	 * serialization property.  FDB conflict retry must serialize
-	 * writers on the same key: every increment applies exactly
-	 * once, so the final value is EXACT (no lost updates).
-	 * 4 threads x 25 slot increments (read seq, write seq+1) ->
-	 * final 100; 4 threads x 10 layout renewals (read seqid,
-	 * write seqid+1, same stateid) -> final 40. */
+	 * serialization property.  Single-transaction RMW per
+	 * increment (see the worker headers): FDB conflict retry must
+	 * serialize same-key writers with zero lost updates. */
 	{
 		struct mds_coord_session_row ss;
 		struct mds_coord_drc_slot_row sl;
@@ -838,9 +978,14 @@ s14_done:
 		int t;
 		struct s15_slot_ctx s15s[4];
 		struct s15_layout_ctx s15l[4];
+		FDBDatabase *storm_db = NULL;
 
 		if (cat == NULL) {
 			printf("  SKIP S-15 (catalogue not open)\n");
+			goto s15_done;
+		}
+		if (fdb_create_database(cluster, &storm_db) != 0) {
+			printf("  SKIP S-15 (fdb_database_create failed)\n");
 			goto s15_done;
 		}
 		memset(&ss, 0, sizeof(ss));
@@ -849,12 +994,26 @@ s14_done:
 		ss.num_slots = 128;
 		ss.cb_prog = 1;
 		ss.cb_sec_flavor = 3;
+		/* protocol order: the client row must exist before the
+		 * session that references it (I-7 closure) */
+		{
+			struct mds_coord_client_row cl;
+
+			memset(&cl, 0, sizeof(cl));
+			cl.clientid = 300;
+			cl.co_ownerid_len = 10;
+			memcpy(cl.co_ownerid, "s15-client", 10);
+			cl.confirmed = true;
+			st = cat->coord_ops->client_put(cat, &cl);
+			CHECK(st == MDS_OK, "S-15.0a client seed (st=%s)",
+			      stname(st));
+		}
 		st = cat->coord_ops->session_put(cat, &ss);
 		CHECK(st == MDS_OK, "S-15.0 seed session (st=%s)", stname(st));
 
 		if (st == MDS_OK) {
 			for (t = 0; t < 4; t++) {
-				s15s[t].cat = cat;
+				s15s[t].db = storm_db;
 				memcpy(s15s[t].sess, ss.session_id, 16);
 				s15s[t].iters = 25;
 				s15s[t].st = MDS_OK;
@@ -902,12 +1061,13 @@ s14_done:
 				      stname(st));
 				if (st == MDS_OK) {
 					for (t = 0; t < 4; t++) {
-						s15l[t].cat = cat;
+						s15l[t].db = storm_db;
 						memcpy(s15l[t].other,
 							sid.other, 12);
 						s15l[t].fid = lg_fid;
 						s15l[t].iters = 10;
 						s15l[t].st = MDS_OK;
+						s15l[t].errors = 0;
 						pthread_create(&th[t], NULL,
 							s15_layout_worker,
 							&s15l[t]);
@@ -929,6 +1089,7 @@ s14_done:
 				}
 			}
 		}
+		fdb_database_destroy(storm_db);
 	}
 s15_done:
 

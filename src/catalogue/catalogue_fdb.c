@@ -1287,7 +1287,10 @@ static enum mds_status fdb_layout_get_by_stateid(
 		uint64_t *offset, uint64_t *length, uint32_t *seqid)
 {
 	struct fdb_state *s = fdb_state(cat);
-	uint8_t k54[13], v54[16], k50[LS_KEY_LEN], v50[LS_FIXED_VAL];
+	/* the 0x50 row carries a ds_ids tail (4B x ds_count, up to 256);
+	 * the fields consumed below live in the fixed 36B head */
+	uint8_t k54[13], v54[16], k50[LS_KEY_LEN],
+		v50[LS_FIXED_VAL + 4 * 256];
 	FDBTransaction *tr;
 	int rc;
 
@@ -1307,9 +1310,9 @@ static enum mds_status fdb_layout_get_by_stateid(
 	ls_key(k50, fdb_get_u64_be(v54), sid);
 	rc = fdb_txn_get(tr, k50, LS_KEY_LEN, v50, sizeof(v50));
 	fdb_transaction_destroy(tr);
-	if (rc != LS_FIXED_VAL)
+	if (rc < LS_FIXED_VAL)
 		return MDS_ERR_NOTFOUND; /* orphan index row */
-	if (clientid) *clientid = fdb_get_u64_be(v54);
+	if (clientid) *clientid = fdb_get_u64_be(v54 + 8);
 	if (fileid) *fileid = fdb_get_u64_be(v54);
 	if (iomode) *iomode = fdb_get_u32_be(v50 + 8);
 	if (offset) *offset = fdb_get_u64_be(v50 + 12);
@@ -1357,7 +1360,10 @@ static enum mds_status fdb_layout_scan_for_file(struct mds_catalogue *cat,
 	{
 		int cnt = 0;
 		fdb_bool_t more = 0;
-		fdb_error_t e2 = fdb_future_get_keyvalue_array(f, NULL,
+		FDBKeyValue const *kvs = NULL;
+		/* &kvs, never NULL: the client writes the array base
+		 * through the out-pointer (segfault on NULL). */
+		fdb_error_t e2 = fdb_future_get_keyvalue_array(f, &kvs,
 				&cnt, &more);
 		if (e2 != 0) {
 			fdb_future_destroy(f);

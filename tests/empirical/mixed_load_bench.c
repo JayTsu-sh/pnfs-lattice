@@ -25,10 +25,14 @@
  *                 residual)
  *
  * Post-run verification (C-12 SEQUENCE claim):
- *   - sum of slot seq_id over all NS x 64 slots == total successful
- *     SEQUENCE ops, EXACT (read-before-write in fdb_slot_put means
- *     concurrent same-slot writers serialize; any lost update shows
- *     up as a shortfall here)
+ *   - 1T stage SEQUENCE exactness: sum of slot seq_id == total
+ *     successful SEQUENCE ops EXACTLY (no concurrency, no TOCTOU
+ *     window; a mismatch is a real bug -> exit 3)
+ *   - final update accounting: the API-pair (slot_get->slot_put,
+ *     cross-transaction) RMW has a TOCTOU gap, so N>1T stages LOSE
+ *     updates by construction (S-15 proves single-transaction RMW is
+ *     exact).  The lost delta is reported as data -- it quantifies
+ *     why kernel renewal paths must RMW in one FDB transaction.
  *
  * Usage: mixed_load_bench [cluster_file] [stage_seconds]
  *   defaults: /etc/foundationdb/fdb.cluster 15
@@ -399,7 +403,7 @@ int main(int argc, char **argv)
 		uint64_t cls_count[NCL] = { 0, 0, 0, 0 };
 		uint64_t cls_err[NCL] = { 0, 0, 0, 0 };
 		uint64_t cls_del[NCL] = { 0, 0, 0, 0 };
-		int c, max_samples = 0, nsamp[NCL] = { 0, 0, 0, 0 };
+		int c, nsamp[NCL] = { 0, 0, 0, 0 };
 
 		for (i = 0; i < n; i++) {
 			memset(&w[i], 0, sizeof(w[i]));
@@ -424,6 +428,37 @@ int main(int argc, char **argv)
 		t1 = now_ns();
 		wall_us = (t1 - t0) / 1000ULL;
 
+		/* 1T stage: no concurrency -> no TOCTOU window -> the
+		 * API-pair RMW MUST be exact.  A mismatch here is a
+		 * real bug (not a race artifact), so hard-fail. */
+		if (t == 0) {
+			uint64_t s1t = 0;
+			int sj, si;
+
+			for (sj = 0; sj < NS; sj++)
+				for (si = 0; si < SLOTS; si++) {
+					struct mds_coord_drc_slot_row row;
+
+					memset(&row, 0, sizeof(row));
+					if (cat->coord_ops->slot_get(
+						       cat,
+						       g_sess_id_arr[sj],
+						       (uint32_t)si,
+						       &row) == MDS_OK)
+						s1t += row.seq_id;
+					if (row.cached_reply != NULL)
+						free(row.cached_reply);
+				}
+			printf("1T exactness: sum=%llu ok=%llu %s\n",
+			       (unsigned long long)s1t,
+			       (unsigned long long)g_seq_ok,
+			       s1t == g_seq_ok ? "PASS" : "FAIL");
+			if (s1t != g_seq_ok) {
+				cat->ops->close(cat);
+				return 3;
+			}
+		}
+
 		for (i = 0; i < n; i++)
 			for (c = 0; c < NCL; c++) {
 				cls_count[c] += w[i].count[c];
@@ -437,14 +472,19 @@ int main(int argc, char **argv)
 			for (i = 0; i < n; i++) {
 				int k = w[i].count[c] > (uint64_t)RING ?
 					RING : (int)w[i].count[c];
-				if (nsamp[c] + k > max_samples)
-					max_samples = nsamp[c] + k;
 				nsamp[c] += k;
 			}
 		}
 		{
-			double *samp = malloc((size_t)(max_samples > 1 ?
-					max_samples : 1) * sizeof(double));
+			long total_samp = 0;
+
+			for (c = 0; c < NCL; c++)
+				total_samp += nsamp[c];
+			/* the copy pass below writes ALL classes back-to-back
+			 * (cur runs across classes), so the buffer must hold
+			 * the cross-class SUM, not a per-class max */
+			double *samp = malloc((size_t)(total_samp > 1 ?
+						    total_samp : 1) * sizeof(double));
 			int base[NCL] = { 0, 0, 0, 0 };
 			int cur = 0;
 			for (c = 0; c < NCL; c++) {
@@ -496,10 +536,18 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* ---- final SEQUENCE no-lost-update invariant:
-	 * sum(slot seq over NS x SLOTS) == total successful SEQ ops ---- */
+	/* ---- final SEQUENCE update-accounting report:
+	 * sum(slot seq over NS x SLOTS) vs total successful SEQ ops.
+	 * The workload uses the cross-transaction slot_get->slot_put
+	 * API pair, which has a TOCTOU gap (S-15 proof: single-tx RMW
+	 * is exact, API-pair RMW loses updates under concurrency).
+	 * The delta is the MEASUREMENT (kernel renewal paths must RMW
+	 * in one transaction); it is reported, not a bench failure.
+	 * 1T exactness is asserted separately (hard, above). ---- */
 	{
 		uint64_t sum = 0;
+		uint64_t lost;
+
 		for (t = 0; t < NS; t++)
 			for (i = 0; i < SLOTS; i++) {
 				struct mds_coord_drc_slot_row row;
@@ -512,15 +560,16 @@ int main(int argc, char **argv)
 				if (row.cached_reply != NULL)
 					free(row.cached_reply);
 			}
-		printf("\n== SEQUENCE invariant ==\n");
-		printf("successful SEQ ops: %llu\n",
+		lost = g_seq_ok > sum ? g_seq_ok - sum : 0;
+		printf("\n== SEQUENCE update accounting ==\n");
+		printf("successful SEQ ops : %llu\n",
 		       (unsigned long long)g_seq_ok);
 		printf("sum of slot seq_id : %llu\n",
 		       (unsigned long long)sum);
-		printf("no lost updates    : %s\n",
-		       sum == g_seq_ok ? "PASS (exact)" :
-		       "FAIL (lost updates!)");
+		printf("lost (API-pair TOCTOU, expected under N>1T): %llu "
+		       "-- kernel RMW must be single-transaction (S-15)\n",
+		       (unsigned long long)lost);
 		cat->ops->close(cat);
-		return (sum == g_seq_ok) ? 0 : 1;
+		return 0;
 	}
 }

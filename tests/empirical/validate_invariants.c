@@ -291,6 +291,8 @@ static lsrow_t  g_ls50[MAXT];     /* 0x50 layout rows      */
 static long     g_nls50 = 0;
 static lsrow_t  g_ls54[MAXT];     /* 0x54 reverse index    */
 static long     g_nls54 = 0;
+static lsrow_t  g_ls51[MAXT];     /* 0x51/0x52 index rows  */
+static long     g_nls51 = 0;
 static ls53_t   g_ls53[MAXT];     /* 0x53 ds rows          */
 static long     g_nls53 = 0;
 static sessrow_t g_se70[MAXT];    /* 0x70 sessions         */
@@ -460,6 +462,33 @@ static int cb_ls50(const FDBKeyValue *kv, void *arg)
 	return 0;
 }
 
+/* 0x51 by-client / 0x52 by-file index rows: 21B key, 8B value.
+ * Both fill the same (fileid, clientid, sid) triple from
+ * different key/value halves; I-6f closes them against the
+ * 0x50 primary row. */
+static int cb_ls51(const FDBKeyValue *kv, void *arg)
+{
+	(void)arg;
+	if (kv->key_length != 21 || kv->value_length != 8) {
+		viol("I-6", "malformed 0x51/0x52 row (klen=%d vlen=%d)",
+		     kv->key_length, kv->value_length);
+		return 0;
+	}
+	if (g_nls51 < MAXT) {
+		/* 0x51 by-client: key cid | value fid;
+		 * 0x52 by-file:   key fid | value cid */
+		int is52 = kv->key[0] == 0x52;
+
+		g_ls51[g_nls51].fileid   = be64(is52 ? kv->key + 1
+						     : kv->value);
+		g_ls51[g_nls51].clientid = be64(is52 ? kv->value
+						     : kv->key + 1);
+		memcpy(g_ls51[g_nls51].sid, kv->key + 9, 12);
+		g_nls51++;
+	}
+	return 0;
+}
+
 static int cb_ls54(const FDBKeyValue *kv, void *arg)
 {
 	(void)arg;
@@ -612,14 +641,15 @@ int main(int argc, char **argv)
 		uint8_t b21[1] = {0x21}, e21[1] = {0x22};
 		uint8_t b30[1] = {0x30}, e30[1] = {0x31};
 		uint8_t b31[1] = {0x31}, e31[1] = {0x32};
-		uint8_t b50[1] = {0x50}, e50[1] = {0x53};
+		uint8_t b50[1] = {0x50}, e50[1] = {0x51};
+		uint8_t b51[1] = {0x51}, e51[1] = {0x53};
 		uint8_t b53[1] = {0x53}, e53[1] = {0x54};
 		uint8_t b54[1] = {0x54}, e54[1] = {0x55};
 		uint8_t b70[1] = {0x70}, e70[1] = {0x71};
 		uint8_t b71[1] = {0x71}, e71[1] = {0x72};
 		uint8_t b72[1] = {0x72}, e72[1] = {0x73};
 		uint8_t b73[1] = {0x73}, e73[1] = {0x74};
-		long n30 = 0, n31 = 0, n50 = 0, n53 = 0, n54 = 0;
+		long n30 = 0, n31 = 0, n50 = 0, n51 = 0, n53 = 0, n54 = 0;
 		long n70 = 0, n71 = 0, n72 = 0, n73 = 0;
 		int serr =
 		    rscan(tr, b10, 1, e10, 1, cb_inode, NULL, &n10) ||
@@ -630,6 +660,7 @@ int main(int argc, char **argv)
 		serr |=
 		    rscan(tr, b31, 1, e31, 1, cb_sm31, NULL, &n31) ||
 		    rscan(tr, b50, 1, e50, 1, cb_ls50, NULL, &n50) ||
+		    rscan(tr, b51, 1, e51, 1, cb_ls51, NULL, &n51) ||
 		    rscan(tr, b53, 1, e53, 1, cb_ls53, NULL, &n53) ||
 		    rscan(tr, b54, 1, e54, 1, cb_ls54, NULL, &n54) ||
 		    rscan(tr, b70, 1, e70, 1, cb_se70, NULL, &n70) ||
@@ -643,8 +674,9 @@ int main(int argc, char **argv)
 		printf("scanned: %ld inodes, %ld dirents, %ld index rows\n",
 		       n10, n20, n21);
 		printf("scanned: %ld stripe hdrs, %ld stripe entries, "
-		       "%ld layout rows, %ld ds rows, %ld rev-idx rows\n",
-		       n30, n31, n50, n53, n54);
+		       "%ld layout rows, %ld layout-idx rows, "
+		       "%ld ds rows, %ld rev-idx rows\n",
+		       n30, n31, n50, n51, n53, n54);
 		printf("scanned: %ld sessions, %ld sess-idx rows, "
 		       "%ld slots, %ld clients\n\n", n70, n71, n72, n73);
 	}
@@ -956,6 +988,27 @@ int main(int argc, char **argv)
 				     "0x53 ds row fid=%llu stateid=%02x.. has no 0x52 index",
 				     (unsigned long long)g_ls53[i6].fileid,
 				     g_ls53[i6].sid[0]);
+			}
+		}
+
+		/* I-6f: every 0x51/0x52 index row closes to a
+		 * matching 0x50 primary row (no orphan index).
+		 * Buffer must hold the WHOLE row: rget only copies when
+		 * vlen <= bufsz, otherwise buf keeps stale bytes. */
+		for (i6 = 0; i6 < g_nls51; i6++) {
+			lsrow_t *r = &g_ls51[i6];
+			uint8_t k50[21], v[36 + 4 * 256];
+
+			k50[0] = 0x50;
+			put_be64(k50 + 1, r->fileid);
+			memcpy(k50 + 9, r->sid, 12);
+			if (rget(tr, k50, 21, v, sizeof(v)) < 36 ||
+			    be64(v) != r->clientid) {
+				bad++;
+				viol("I-6",
+				     "0x51/0x52 (fid=%llu cid=%llu) orphan: no matching 0x50 row",
+				     (unsigned long long)r->fileid,
+				     (unsigned long long)r->clientid);
 			}
 		}
 
