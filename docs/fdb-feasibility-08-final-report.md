@@ -210,3 +210,39 @@ slot_get→slot_put 是**跨事务**的（get 一个事务、put 另一个）：
   作为 I-6 的子校验随 ALL PASS 通过。
 **不改变 Defer 决策效力**：C-12 现为"槽已实现 + lab-REAL 实测通过"，仍缺生产等价性 + Phase 4 A/B，
 G-GATE-6 不变。
+
+---
+
+## 9. Phase 4 C-5 增量（2026-10-16 FDB HA/恢复故障注入 lab-REAL）
+
+> 证据等级：**lab-REAL（node 44，真实 3 节点 triple FDB 集群，PVE 真实停/启节点）**。填 C-5 的
+> "FDB 侧零实测"盲点（`-10` 行 C-5 / `-09` §4）——G-GATE-6 的 D5（可靠性）输入。
+
+**实验**：保持 601(44) 为存活 fdbcli 客户端，对 602(45/fdb-node2) 做 `qm stop` → 观察降级 →
+`qm start` → 验证恢复（one-at-a-time，绝不并发停第二节点）。triple 提交 quorum=2/3，基线
+Fault Tolerance=1 machine without data loss。（603 节点对称复测未做——与 602 对称，一次完整
+故障+恢复周期即 C-5 代表性结果。）
+
+**结果**（raw 归档 `results/fdb/phase4_c5_ha_20261016/c5_ha_fault_injection.log`）：
+- **基线（3/3）**：triple、3 进程、FT=1 machine、Replication Healthy、3 MB / 637 MB disk。
+- **停 1/3 节点（602）**：coordinator 显示 44/46 reachable、45 unreachable（"will remain
+  operational as long as we can connect to a quorum"）；但 `status minimal` → **unavailable**，
+  `status json` → **`recovery_state=recruiting_transaction_servers`、`available=false`、
+  `seconds_since_last_recovered=-1`（>3 min 从未恢复）**。角色已重选（46=controller、
+  44=master+data_distributor+ratekeeper+consistency_scan），但**事务日志组无法在 2/3 重组**。
+  交叉验证：46 上 `status minimal` 同样 unavailable（集群级、非 44 客户端问题）；44/46 fdbserver
+  均运行 + LISTENING。
+- **恢复节点（602 start）**：+75s `status minimal` → **available**；3/3 进程、FT 恢复、
+  Replication Healthy、**数据无损**（3 MB / 637 MB 不变）。
+- **数据完整性**：validate_invariants 真实不变量 I-1/I-2/I-4/I-5/I-6/I-9 全 PASS（数据尺寸前后
+  一致）；I-7 FAIL 系 **mixed_load_bench 种子缺口**（seed 建 16 个 0x70 session 未建对应
+  0x73 client——`session_put` 无 `client_put`、且先 `catalogue_fdb_wipe`），**与节点故障无关、
+  非数据丢失**，属 C-12 bench 种子待修项（follow-up）。
+
+**含义（解释；机制=2/3 下 TX-server 招募卡住）**：极简 3 节点 FDB 集群**非 2/3 持续可用**——丢 1
+节点会卡在"招募事务服务器"、不可用（观测窗口 >3 min 未恢复）。生产 FDB HA 需**更多节点/多区域**，
+让事务日志组能在缺节点时重组。这与 RonDB 侧 lab 实测（ndbd 卡死、人工重启）**对称**：极简 3 节点下
+两侧都非"故障期间持续可用"，生产 HA 都需更大规模。
+
+**对 G-GATE 的影响**：C-5 FDB 侧从"零实测"推进到 **lab-REAL**（D5 可靠性有真实故障注入证据），
+不改变 Defer 决策效力；剩余 = 603 对称复测 + K-9 journal 对账 + 确认更长窗口是否终会 2/3 恢复。

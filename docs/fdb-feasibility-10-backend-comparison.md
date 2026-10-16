@@ -20,7 +20,7 @@
 | C-2 | 热父目录扩展 | shared 16T 23.1k（spread 37.8k → 热父慢 1.6x，**16T 扩展墙**） | 普通 RMW 374→369 **硬墙**（p99 122-175ms）；atomic_op 后 16T 3162 ops/s 近线性 9.8x、p99 8.55ms、CHG 精确 | FDB 冲突=键级读写集 → 任何 RMW 必须 atomic_op；NDB 行级 RMW 冲突成本低（因提交快）。**两侧各有一道结构性墙，消除手段不同** | lab-REAL（FDB 全路径 K-1）+ lab（两侧微基准） | `-09` §9 / `-01` §3 / `-00` §7.1 |
 | C-3 | rename / TOCTOU 正确性模型 | 单节点事务 + 8 类显式 ns_locks（生产在用，成熟） | 快照隔离 + 无原生锁：路线 A（保 ns_locks）/ B（去锁赌快照）**未拍板** | 最能区分两设计的维度；FDB 侧零实测，是 G-GATE-1 正确性红线 | REFERENCE（代码）+ HYPOTHESIS（路线未定） | `-00` §4 / `-05` §6 / `-09` §9（K-4 DEFERRED） |
 | C-4 | 错误语义 / 未知提交 | 错误码明确（无 unknown-commit 域；4009 集群降级可诊断） | 1021 commit_unknown_result：库当可重试（与官方文档一致），**防双应用是应用层责任**；G1/G2 映射缺陷已修 | FDB 2PC 提交存在"未知"态 → 新增对账维度（journal 面三分对账待实施） | lab-REAL（J-03 实测 + G1/G2 fix） | `-09` §8 / `-02` §A |
-| C-5 | 恢复 / HA | ndbd checkpoint + 集群状态机；lab 实测 ndbd 卡死、两次人工重启（可用性事件，一天两次） | 无锁、快照恢复、高可用=核心卖点（FDB 侧**零实测**） | 对称盲：RonDB 侧有实测恢复事件，FDB 侧只有官方文档——比较的"优点侧"证据不全 | lab（RonDB 事件）+ REFERENCE（FDB 官方） | `-01` §4 / `-08` §4 |
+| C-5 | 恢复 / HA | ndbd checkpoint + 集群状态机；lab 实测 ndbd 卡死、两次人工重启（可用性事件，一天两次） | lab-REAL（2026-10-16 node 44，3 节点 triple 停 1 节点）：**停 1/3 → 卡 "recruiting_transaction_servers"、available=false、>3min 未恢复**；恢复节点 → 3/3 可用、数据无损。极简 3 节点**非 2/3 持续可用**（生产需更多节点/多区域） | 对称盲已填 FDB 侧：两侧都有实测恢复事件（RonDB ndbd 卡死 / FDB TX-server 招募卡住）——共同点=极简 3 节点下**两侧都非"故障期间持续可用"**，生产 HA 都需更大规模 | lab（RonDB 事件）+ **lab-REAL（FDB 故障注入 2026-10-16）** | `-01` §4 / `-08` §8 / results/fdb/phase4_c5_ha_20261016/ |
 | C-6 | 二级索引 | 引擎内原生索引 | 无原生索引 → 0x21 键空间双写 ~28B/op（~8% 写字节） | 字节等价（NDB 同数据量），但索引一致性变为应用层责任（I-9 双写集合可机检） | lab-REAL（K-5） | `-09` §9 / `-05` §2.2 |
 | C-7 | 值大小 / schema | 285B wire | 285B **直接复用**（rondb_schema.h:501 "extends FDB format"）；=100KB 告警阈值的 0.28%，trace 零告警 | wire 格式设计上已面向 FDB，数据模型转换成本低于预期 | lab-REAL（K-7） | `-09` §9 / `-05` §2.1 |
 | C-8 | 队列 / GC 族（K-2） | 表 + CAS claim（gc_seq FIFO、owner 分区 drain） | 键前缀分片 + TTL claim + dead-letter（0x41-0x43 **未实现**；dead-letter 前缀**仍未定**） | FDB 侧纯设计，零实测；评审缺口已登记（`-04` §4） | HYPOTHESIS（设计）+ REFERENCE | `-05` §2.4 / `-04` §4 / `-09` §9（K-2 DEFERRED） |
@@ -72,7 +72,7 @@
 | LAYOUTGET（47.5%）/ SEQUENCE（23.8%）FDB 侧未测 | 真实流量最高频两行只能用 H-03 微基准外推（C-12） | 槽实现**已完成**（2026-10-15：stripe map + layout state + 协议态 + 单事务 RMW——read-before-write 跨事务对 TOCTOU 缺口→S-15 改单事务 RMW 验证、mixed_load_bench 上报 TOCTOU 丢失量 + S-12..S-15/I-6/I-6f/I-7，本地编译通过；2026-10-16 另修 catalogue_fdb.c 两处真 bug：0x50 行 ds_ids 尾截断 + scan 的 kvs out 指针 NULL segfault）；**lab-REAL 已跑通（2026-10-16，node 44 真实 3 节点）**——S-12..S-15 61/61 PASS（S-15 单事务 RMW 零丢更新）+ I-6/I-6f/I-7 ALL PASS + mixed_load_bench 1T 精确 1725/1725、16T 4634 ops/s、N>1T 跨事务 API 对 TOCTOU 丢失 690/39909（1.73%），raw 归档 `results/fdb/phase4-c12-*-2026-10-16.log`；此前"node 44 被拒"系测错用户（FDB 节点用 `root@`）的误判 → 盲点已填，仅剩面外 HYPOTHESIS 待 Phase 4 真实环境 A/B |
 | 无同流 A/B（现为同口径锚点对照） | op 混合的端到端 P50/p99 无法比较 | Phase 4 真实环境同流 A/B |
 | K-4 rename 未测 | 正确性红线行（C-3）无 REAL 证据 | 路线 A/B 拍板 + 故障注入（J-02/J-04） |
-| FDB HA/恢复未测 | FDB 优点侧最强行（C-5）无 REAL | Phase 4：集群故障注入 + K-9 对账 |
+| FDB HA/恢复已 lab-REAL（2026-10-16 node 44） | C-5 FDB 侧已 lab-REAL：停 1/3 节点→卡 recruiting_transaction_servers 不可用、恢复节点→3/3 无损 | 剩余：603 节点对称复测 + K-9 journal 对账 + 确认是否更长窗口终会 2/3 恢复（本次 >3min 未恢复） |
 | 生产等价性未验收 | 全部 lab-REAL 不可升生产 REAL（G-GATE-6） | §01 等价性验收 |
 
 ## 5. 对决策的含义（不是判断）
