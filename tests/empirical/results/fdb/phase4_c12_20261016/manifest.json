@@ -1,0 +1,20 @@
+{
+  "run_id": "phase4_c12_20261016",
+  "commit_sha": "57ba769",
+  "backend": "fdb",
+  "env": {
+    "cluster": "3-node FDB 7.4.8, 10.131.9.44-46, triple-replicated, client==server",
+    "run_host": "10.131.9.44 (fdb-node1, root@ via /root/.ssh/fdbenv)",
+    "note": "lab 基准集群，非生产拓扑；FDB 节点用 root@（非 pnfs@，后者仅存于 MDS/DS 164/165）。此前'node 44 ssh 被拒'系测错用户的误判（测的是 pnfs@44），恢复访问后本次跑通。"
+  },
+  "slo_anchor": "none（SLO 未登记，不代判）；对照锚点 = fdb-feasibility-06 §1.2.4 配方（LAYOUTGET 45% / SEQUENCE 25% / READ 20% / other 10%）",
+  "evidence_class": "lab-REAL",
+  "raw_paths": [
+    "phase4-c12-slice-harness-2026-10-16.log（fdb_slice_harness S-12..S-15 61/61 PASS，RC=0；S-15 单事务 RMW slot 风暴终值 seq=100、renewal 风暴终值 seqid=40，零丢更新）",
+    "phase4-c12-validate-invariants-2026-10-16.log（validate_invariants I-6（含 I-6f 0x51/0x52↔0x50 子校验）/I-7 ALL PASS，RC=0；扫 3 layout 行/6 layout-idx/2 ds/3 rev-idx/1 session/1 client）",
+    "phase4-c12-mixed-load-bench-2026-10-16.log（mixed_load_bench 1→16T RC=0；1T 精确 sum=1725 ok=1725；吞吐 1T=461→2T=911→4T=1705→8T=2940→16T=4634 ops/s；N>1T 跨事务 API 对 TOCTOU 丢失 690/39909=1.73%）"
+  ],
+  "operator": "xiaonan.he（Hermes agent 协助）",
+  "timestamp": "2026-10-16",
+  "notes": "C-12 盲点（`-10` §4）lab-REAL 填数。S-15 单事务 RMW 验证'同键并发写零丢更新'性质本身；mixed_load_bench 沿用跨事务 API 对（对齐内核 drc_slot 续期的真实调用形状），N>1T TOCTOU 丢失 690/39909=1.73% 作为**数据**上报（量化'内核续期路径必须单事务 RMW'，单事务 RMW 零丢失已由 S-15 lab 实证），丢失量非失败判据。TOCTOU 丢失量为并发时序相关，逐 run 波动（本次 690，首次 run 494）。commit 57ba769 = C-12 全部代码定稿（S-15 单事务 RMW + mixed_load_bench TOCTOU 数据化 + I-6f + catalogue_fdb.c 两处 buffer bug 修复）。"
+}

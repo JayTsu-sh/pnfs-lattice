@@ -1,0 +1,45 @@
+=== mixed_load_bench ===
+commit 57ba769 (C-12 single-tx RMW) | node 10.131.9.44 | cluster triple/3nodes | Fri Oct 16 05:12:42 UTC 2026
+== FDB mixed-load bench (C-12/K-3, cluster: /etc/foundationdb/fdb.cluster) ==
+recipe: fdb-feasibility-06 §1.2.4 (LAYOUTGET 45% / SEQUENCE 25% / READ 20% / other 10%)
+seed: 64 files (stripe+layout) + 16 sessions x 64 slots; stages 1/2/4/8/16T x 15s
+
+seeded: 64 files, 16 sessions
+
+1T exactness: sum=1725 ok=1725 PASS
+== stage 1T (15.00 s) ==
+  total ops: 6917  ops/s: 461  errors: 0  delays: 0
+  LAYOUTGET            ops=3122     p50=   1520.6us p95=   1816.2us p99=   2056.1us err=0 del=0
+  SEQUENCE             ops=1725     p50=   2979.4us p95=   3591.2us p99=   4029.5us err=0 del=0
+  READ(fh/attr/access) ops=1380     p50=    612.0us p95=    751.6us p99=    923.1us err=0 del=0
+  OTHER(churn)         ops=690      p50=   5727.1us p95=   6695.6us p99=   7461.9us err=0 del=0
+== stage 2T (15.00 s) ==
+  total ops: 13668  ops/s: 911  errors: 0  delays: 0
+  LAYOUTGET            ops=6188     p50=   1556.2us p95=   1846.8us p99=   2128.2us err=0 del=0
+  SEQUENCE             ops=3400     p50=   2983.5us p95=   3477.0us p99=   5091.4us err=0 del=0
+  READ(fh/attr/access) ops=2720     p50=    637.8us p95=    788.4us p99=    943.0us err=0 del=0
+  OTHER(churn)         ops=1360     p50=   5795.7us p95=   6589.4us p99=   8879.5us err=0 del=0
+== stage 4T (15.00 s) ==
+  total ops: 25588  ops/s: 1705  errors: 0  delays: 0
+  LAYOUTGET            ops=11520    p50=   1714.5us p95=   2107.3us p99=   2797.3us err=0 del=0
+  SEQUENCE             ops=6400     p50=   3052.9us p95=   3614.8us p99=   6697.8us err=0 del=0
+  READ(fh/attr/access) ops=5120     p50=    688.4us p95=    917.9us p99=   1143.5us err=0 del=0
+  OTHER(churn)         ops=2548     p50=   6020.9us p95=   7250.9us p99=   9903.6us err=0 del=0
+== stage 8T (15.01 s) ==
+  total ops: 44124  ops/s: 2940  errors: 0  delays: 0
+  LAYOUTGET            ops=19917    p50=   2116.4us p95=   2667.2us p99=   4182.3us err=0 del=0
+  SEQUENCE             ops=11034    p50=   3313.0us p95=   4225.0us p99=   8683.6us err=0 del=0
+  READ(fh/attr/access) ops=8800     p50=    786.2us p95=   1106.7us p99=   1594.1us err=0 del=0
+  OTHER(churn)         ops=4373     p50=   6746.0us p95=   8373.5us p99=  13913.6us err=0 del=0
+== stage 16T (15.01 s) ==
+  total ops: 69535  ops/s: 4634  errors: 0  delays: 0
+  LAYOUTGET            ops=31502    p50=   2761.0us p95=   3778.0us p99=   5537.0us err=0 del=0
+  SEQUENCE             ops=17350    p50=   4205.0us p95=   6029.0us p99=  10563.7us err=0 del=0
+  READ(fh/attr/access) ops=13800    p50=    977.3us p95=   1472.0us p99=   2151.5us err=0 del=0
+  OTHER(churn)         ops=6883     p50=   8007.5us p95=  10696.7us p99=  16198.2us err=0 del=0
+
+== SEQUENCE update accounting ==
+successful SEQ ops : 39909
+sum of slot seq_id : 39219
+lost (API-pair TOCTOU, expected under N>1T): 690 -- kernel RMW must be single-transaction (S-15)
+MLB_RC=0

@@ -1,0 +1,20 @@
+=== validate_invariants ===
+commit 57ba769 (C-12 single-tx RMW) | node 10.131.9.44 | cluster triple/3nodes | Fri Oct 16 05:12:42 UTC 2026
+== validate_invariants (FDB slice, read-only) ==
+cluster: /etc/foundationdb/fdb.cluster
+
+scanned: 108 inodes, 107 dirents, 107 index rows
+scanned: 0 stripe hdrs, 0 stripe entries, 3 layout rows, 6 layout-idx rows, 2 ds rows, 3 rev-idx rows
+scanned: 1 sessions, 1 sess-idx rows, 2 slots, 1 clients
+
+I-1/I-2 dirent->inode closure: PASS (107 dirents, no dangling)
+I-4 NL == 2 + dir_children: PASS (3 parents)
+I-5 fileid unique + monotonic: PASS (counter=5122, 108 fids, dup_samples=0)
+I-9 orphans=0, 0x21 dual-write set equal: PASS
+I-3 rename atomicity: SKIPPED (unimplemented, G1/NOSUPPORT)
+I-8 queue claim: SKIPPED (keyspace not in slice)
+I-6 stripe/layout refs: PASS (0 hdrs, 3 layout rows, 2 ds rows, 3 rev rows)
+I-7 protocol state: PASS (1 sessions, 1 index rows, slots/clients well-formed)
+
+== ALL PASS ==
+VALIDATOR_RC=0

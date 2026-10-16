@@ -18,3 +18,6 @@
 §8 注入 9/9 / §9 hotdir bench 逐线程表），manifest 的 `raw_paths` 指向对应文档节。
 既有 RonDB 侧基线目录（`../0003`…`0007`、`../baseline_lattice_main`）早于本规范建立，
 未补 manifest（如需 A/B 回链可后续补，不阻塞）。
+
+Phase 4 C-12（2026-10-16）run 归档在 `phase4_c12_20261016/`（S-12..S-15 61/61 + I-6/I-6f/I-7 ALL PASS
++ mixed_load_bench 1→16T；commit 57ba769；回链 `-08` §8 / `-10` C-12·§4 / `-05` LAYOUTGET·SEQUENCE）。
