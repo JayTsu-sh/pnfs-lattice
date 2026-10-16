@@ -133,10 +133,10 @@ D3 真实验证资产已在 Phase 3 落地（见上行 + §7），但**全部为
 
 ---
 
-## 8. Phase 4 C-12 增量（2026-10-15，实现完成 / lab 实测挂起）
+## 8. Phase 4 C-12 增量（2026-10-15 实现 / 2026-10-16 lab-REAL 已跑通）
 
-> 证据等级：**本增量尚无 lab-REAL 实测**（实现 + 本地编译验证，lab 集群访问受阻，见下）。
-> **不改变"Defer"决策效力**——只把 C-12 盲点（`-10` §4）从"槽未实现"推进到"槽已实现、实测待跑"。
+> 证据等级：**lab-REAL 已实测（2026-10-16，node 44 真实 3 节点 FDB 集群）**——S-12..S-15 61/61、I-6/I-6f/I-7 ALL PASS、mixed_load_bench 1→16T RC=0（详见下"验证状态"）。
+> **不改变"Defer"决策效力**——把 C-12 盲点（`-10` §4）从"槽未实现"推进到"槽已实现 + lab-REAL 实测通过"（仍缺生产等价性 + Phase 4 A/B）。
 
 **落地范围（C-12 盲点的代码侧收口）**：
 1. **FDB 后端补 3 族槽位**（`catalogue_fdb.c`，~1500 行，`ENABLE_FDB` 默认 OFF）：
@@ -179,24 +179,34 @@ D3 真实验证资产已在 Phase 3 落地（见上行 + §7），但**全部为
   读回被静默截断；扩到 `LS_FIXED_VAL + 4*256` 且 `rc != LS_FIXED_VAL` → `rc < LS_FIXED_VAL`；
   (b) `fdb_layout_scan_for_file` 的 `fdb_future_get_keyvalue_array` 首参原传 NULL——客户端经 out 指针
   写数组基址，NULL 即 segfault；改 `&kvs`。
-- **lab 集群运行受阻**：node 44（10.131.9.44）ssh publickey 全部被拒
-  （/root/.ssh/fdbenv，2026-10-15 15:13 + **2026-10-16 复核** 均 Permission denied RC=255）。
-  按"真实拒绝交清单不重试"纪律**挂起**，恢复访问后的执行清单见 `-09` 附录 C 同型命令（
-  S-12..S-15 两轮（S-15 现为单事务 RMW）+ I-6/I-6f/I-7 正负向 + mixed_load_bench 1→16T）。
+- **lab-REAL 已跑通（2026-10-16，node 44 真实 3 节点集群）**：此前"node 44 ssh 被拒"是**测错用户**
+  的误判——FDB 节点 44/45/46 用 `root@`（非 `pnfs@`，后者仅存于 MDS/DS 164/165），`root@10.131.9.44`
+  用 fdbenv 实测可登，集群 3/3 triple-redundancy Healthy。据此完成 lab 实测（执行清单 = `-09` 附录 C；
+  raw 输出归档 `tests/empirical/results/fdb/phase4-c12-{slice-harness,validate-invariants,mixed-load-bench}-2026-10-16.log`，commit 57ba769）：
+  - `fdb_slice_harness`（S-12..S-15）：**61/61 PASS，RC=0**。S-15 **单事务 RMW** slot 风暴终值
+    seq=100（want 100）、renewal 风暴终值 seqid=40（want 40）——**零丢更新**。
+  - `validate_invariants`（I-6 含 I-6f 子校验 / I-7）：**ALL PASS，RC=0**（扫 3 layout 行 / 6 layout-idx /
+    2 ds / 3 rev-idx / 1 session / 1 client，stripe+layout+协议态索引闭环全通过）。
+  - `mixed_load_bench`（1→16T 配方 `-06` §1.2.4）：**RC=0**。1T 档 SEQUENCE 精确 sum=1725 ok=1725
+    （无并发零丢）；吞吐近线性 1T=461 → 2T=911 → 4T=1705 → 8T=2940 → 16T=4634 ops/s；**N>1T 跨事务
+    API 对 TOCTOU 丢失 690/39909 SEQ ops（1.73%）**——量化"内核 drc_slot 续期必须单事务 RMW"（S-15
+    已 lab 实证单事务 RMW 零丢失），丢失量为数据非失败判据。
 
-**对 G-GATE 的影响**：无。G-GATE-6 仍缺生产等价性 + Phase 4 真实环境 A/B；
-C-12 升级 lab-REAL 的前提（lab 实测数据）在恢复集群访问后补齐。
+**对 G-GATE 的影响**：C-12 盲点从"槽未实现"推进到**"槽已实现 + lab-REAL 实测通过"**（G-GATE-6 的
+lab 前提已满足）。仍缺生产等价性验收（§01）+ Phase 4 真实环境 A/B——故**不改变"Defer"决策效力**，
+只是把 C-12 的 lab 证据补齐。
 
-**C-12 细化（2026-10-16，本地验证 / lab 仍挂起）**：
+**C-12 细化（2026-10-16，lab-REAL 已通过）**：
 首版把"写前加同键探测"当作 no-lost-update 的修复，设计 S-15 时发现 catalogue API 的
 slot_get→slot_put 是**跨事务**的（get 一个事务、put 另一个）：put 事务的读前探测注册的是其**新**
 读版本，写入值却按早先 get 算出——并发下中间提交仍被静默丢失（TOCTOU 缺口，读前探测只挡"同事务内"
-的写，挡不住跨事务）。据此三处改动：
-- **S-15 改为单事务 RMW**（raw FDB，读+写同一 FDB 事务，冲突重试序列化同键写）验证"同键并发写零丢
-  更新"这一性质本身；catalogue API 的跨事务对不再作为 no-lost-update 的验证单元。
-- **mixed_load_bench 沿用跨事务 API 对**（对齐内核 drc_slot 续期的真实调用形状）：1T 档无并发→硬断言
-  精确（不符即真 bug，退码 3）；N>1T 档上报 API 对 TOCTOU 丢失量作为**数据**——量化"内核续期路径
-  必须单事务 RMW"这一对内核侧的硬要求。
-- validate_invariants 增 **I-6f**（0x51/0x52 by-client/by-file 索引行↔0x50 主行闭环，无孤儿索引）。
-以上均本地编译验证（RC=0），**lab 实测仍挂起**（node 44 恢复后一并跑，见上执行清单）。
-**不改变 Defer 决策效力**：C-12 仍停在"槽已实现 + 本地编译验证、lab 实测待跑"，G-GATE-6 不变。
+的写，挡不住跨事务）。据此三处改动（均已 lab-REAL 验证）：
+- **S-15 改为单事务 RMW**（raw FDB，读+写同一 FDB 事务，冲突重试序列化同键写）：lab 实测 slot/renewal
+  风暴终值精确、**零丢更新**，验证"同键并发写零丢更新"这一性质本身。
+- **mixed_load_bench 沿用跨事务 API 对**（对齐内核 drc_slot 续期真实调用形状）：1T 档精确
+  sum=1725 ok=1725 PASS；N>1T 档上报 TOCTOU 丢失 690/39909（1.73%）作为**数据**——量化"内核续期
+  路径必须单事务 RMW"这一对内核侧的硬要求（单事务 RMW 的零丢失已由 S-15 lab 实证）。
+- validate_invariants 增 **I-6f**（0x51/0x52 by-client/by-file 索引行↔0x50 主行闭环，无孤儿索引）：
+  作为 I-6 的子校验随 ALL PASS 通过。
+**不改变 Defer 决策效力**：C-12 现为"槽已实现 + lab-REAL 实测通过"，仍缺生产等价性 + Phase 4 A/B，
+G-GATE-6 不变。
