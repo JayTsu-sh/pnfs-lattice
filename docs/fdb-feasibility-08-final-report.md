@@ -148,26 +148,55 @@ D3 真实验证资产已在 Phase 3 落地（见上行 + §7），但**全部为
      （NDB `ix_layout_state_stateid` 等价，`-05` 前缀表漏列已补登记），五索引单事务维护。
    - **0x70-0x73 协议态族**：sessions / session_by_client / drc_slots（NDB PK=(clientid,slot_id)，
      `-05` §2.6 误写 session_id 已更正）/ clients。
-2. **read-before-write RMW（本增量揪出的真实缺口）**：FDB 冲突检测只对**同事务内读过**的键生效——
-   `fdb_slot_put` / `fdb_layout_grant` 原为纯写事务，并发同键写会**静默丢更新**。两者写前加
-   `fdb_txn_get` 同键探测（注册冲突范围），harness S-15（同键并发 RMW 风暴，终值精确断言）为其验证器。
+2. **read-before-write RMW（本增量揪出的真实缺口，2026-10-16 细化）**：FDB 冲突检测只对
+   **同事务内读过**的键生效——`fdb_slot_put` / `fdb_layout_grant` 原为纯写事务，并发同键写会
+   **静默丢更新**。首版给两者写前加 `fdb_txn_get` 同键探测；**细化发现该 get 与写分属两个事务**
+   （catalogue API 的 slot_get→slot_put 是跨事务 RMW）：put 事务的读前探测注册的是**新**读版本，
+   而写入的值按**早先 get** 算出——中间任何并发提交都被**静默丢失**（TOCTOU 缺口：读前探测只挡
+   "同事务内"的写，挡不住跨事务）。真正的 no-lost-update 单元是**单事务 RMW**（读+写同一 FDB
+   事务，冲突重试序列化同键写）。故 **S-15 改为单事务 RMW 风暴**（raw FDB，读+写同事务，终值精确
+   断言）验证该性质，mixed_load_bench 则沿用跨事务 API 对（对齐内核 drc_slot 续期真实路径）把
+   TOCTOU 丢失量作为**数据**上报（量化"内核续期必须单事务 RMW"，见下 §5）。
 3. **功能断言**（`fdb_slice_harness.c`）：S-12 stripe map round-trip（单/多 stripe + inline 不建键）、
    S-13 layout grant/lookup/scan（五索引一致）、S-14 协议态 round-trip（session+slot+client）、
-   S-15 并发 slot/layout 写风暴（4 线程同键 RMW，终值精确 = 线程数×轮数，零丢更新）。
+   S-15 并发 slot/layout 写风暴（**单事务 RMW**：4 线程同键、读+写同 FDB 事务，终值精确 = 线程数×轮数，零丢更新）。
 4. **不变量校验**（`validate_invariants.c`）：I-6（stripe 头↔明细闭环 + layout 四索引交叉验证）、
+   I-6f（0x51/0x52 by-client/by-file 索引行↔0x50 主行闭环，无孤儿索引，2026-10-16 新增）、
    I-7（session↔client 索引闭环 + 值 well-formed）从 SKIPPED 升级为真校验。
 5. **混合负载压测**（`tests/empirical/mixed_load_bench.c`，新建）：按 `-06` §1.2.4 配方
    （LAYOUTGET 45% / SEQUENCE 25% / PUTFH+GETATTR+ACCESS 20% / other 10%），1→16 线程 × 15s 每档，
-   seeded keyspace 共享，per-class p50/p95/p99 延迟采样 + SEQUENCE RMW 终验。
+   seeded keyspace 共享，per-class p50/p95/p99 延迟采样 + SEQUENCE 更新核算（1T 档无并发→硬断言
+   精确，不符即真 bug 退码 3；N>1T 档上报跨事务 API 对 TOCTOU 丢失量作为**数据**，不作失败判据）。
 
-**验证状态（本地）**：
-- `cmake -DENABLE_FDB=ON` 全量构建 RC=0；`-DENABLE_FDB=OFF` 树不受影响（catalogue_fdb.c 不参与 OFF 编译）。
+**验证状态（本地，2026-10-16 细化后复核）**：
+- `cmake -DENABLE_FDB=ON` 全量构建 RC=0（本会话重配复核）；`-DENABLE_FDB=OFF` 树不受影响
+  （catalogue_fdb.c 不参与 OFF 编译，改动全在 FDB-gated 源集内）。
 - 四个经验二进制（catalogue_fdb.c / fdb_slice_harness.c / validate_invariants.c / mixed_load_bench.c）
-  `gcc -O2 -Wall -Wextra` 独立编译零警告。
+  `gcc -O1 -Wall` 独立编译零警告（本会话复核 RC=0；本机 KVM CPU 无 AVX，FDB 链接二进制只能 type-check+link，
+  运行留 node 44）。
+- 细化另修 `catalogue_fdb.c` 两处真 bug（REAL，代码侧）：
+  (a) 0x50 layout 行值缓冲原仅 36B 定长头——多 stripe 文件行尾带 ds_ids 尾（4B×ds_count，最多 256），
+  读回被静默截断；扩到 `LS_FIXED_VAL + 4*256` 且 `rc != LS_FIXED_VAL` → `rc < LS_FIXED_VAL`；
+  (b) `fdb_layout_scan_for_file` 的 `fdb_future_get_keyvalue_array` 首参原传 NULL——客户端经 out 指针
+  写数组基址，NULL 即 segfault；改 `&kvs`。
 - **lab 集群运行受阻**：node 44（10.131.9.44）ssh publickey 全部被拒
-  （/root/.ssh/fdbenv + 本机 3 个备用 key 均 Permission denied，2026-10-15 15:13 探测）。
+  （/root/.ssh/fdbenv，2026-10-15 15:13 + **2026-10-16 复核** 均 Permission denied RC=255）。
   按"真实拒绝交清单不重试"纪律**挂起**，恢复访问后的执行清单见 `-09` 附录 C 同型命令（
-  S-12..S-15 两轮 + I-6/I-7 正负向 + mixed_load_bench 1→16T）。
+  S-12..S-15 两轮（S-15 现为单事务 RMW）+ I-6/I-6f/I-7 正负向 + mixed_load_bench 1→16T）。
 
 **对 G-GATE 的影响**：无。G-GATE-6 仍缺生产等价性 + Phase 4 真实环境 A/B；
 C-12 升级 lab-REAL 的前提（lab 实测数据）在恢复集群访问后补齐。
+
+**C-12 细化（2026-10-16，本地验证 / lab 仍挂起）**：
+首版把"写前加同键探测"当作 no-lost-update 的修复，设计 S-15 时发现 catalogue API 的
+slot_get→slot_put 是**跨事务**的（get 一个事务、put 另一个）：put 事务的读前探测注册的是其**新**
+读版本，写入值却按早先 get 算出——并发下中间提交仍被静默丢失（TOCTOU 缺口，读前探测只挡"同事务内"
+的写，挡不住跨事务）。据此三处改动：
+- **S-15 改为单事务 RMW**（raw FDB，读+写同一 FDB 事务，冲突重试序列化同键写）验证"同键并发写零丢
+  更新"这一性质本身；catalogue API 的跨事务对不再作为 no-lost-update 的验证单元。
+- **mixed_load_bench 沿用跨事务 API 对**（对齐内核 drc_slot 续期的真实调用形状）：1T 档无并发→硬断言
+  精确（不符即真 bug，退码 3）；N>1T 档上报 API 对 TOCTOU 丢失量作为**数据**——量化"内核续期路径
+  必须单事务 RMW"这一对内核侧的硬要求。
+- validate_invariants 增 **I-6f**（0x51/0x52 by-client/by-file 索引行↔0x50 主行闭环，无孤儿索引）。
+以上均本地编译验证（RC=0），**lab 实测仍挂起**（node 44 恢复后一并跑，见上执行清单）。
+**不改变 Defer 决策效力**：C-12 仍停在"槽已实现 + 本地编译验证、lab 实测待跑"，G-GATE-6 不变。
