@@ -21,3 +21,7 @@
 
 Phase 4 C-12（2026-10-16）run 归档在 `phase4_c12_20261016/`（S-12..S-15 61/61 + I-6/I-6f/I-7 ALL PASS
 + mixed_load_bench 1→16T；commit 57ba769；回链 `-08` §8 / `-10` C-12·§4 / `-05` LAYOUTGET·SEQUENCE）。
+
+Phase 4 C-5 FDB HA/恢复故障注入（2026-10-16）run 归档在 `phase4_c5_ha_20261016/`（停 1/3 节点 →
+`recruiting_transaction_servers` unavailable、>3min 未恢复；恢复节点 → 3/3 available 数据无损；
+commit 57ba769；回链 `-08` §9 / `-10` C-5·§4）。

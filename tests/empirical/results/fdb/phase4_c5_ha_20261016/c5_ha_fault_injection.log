@@ -1,0 +1,112 @@
+# C-5 FDB HA/Recovery fault injection — Phase 4 lab-REAL
+# commit 57ba769 | fdbcli client on 10.131.9.44 (fdb-node1) | cluster triple / 3 nodes | FDB 7.4.8
+# 2026-10-16
+# Method: keep 601(44) as the surviving fdbcli client; ONE node fault (602/fdb-node2/45) via PVE
+#   qm stop -> verify degraded -> qm start -> verify recovery. Triple commit quorum = 2/3;
+#   baseline Fault Tolerance = 1 machine without data loss. NEVER stop 2 at once (1/3 = data-loss
+#   risk). 603(46) cycle not run (symmetric to 602; one full cycle is the representative C-5 result).
+
+=====================================================================
+[0] BASELINE (3/3 running) — fdbcli status
+=====================================================================
+Configuration:
+  Redundancy mode        - triple
+  Coordinators           - 3
+Cluster:
+  FoundationDB processes - 3
+  Fault Tolerance        - 0 machines (1 without data loss)
+Data:
+  Replication health     - Healthy
+  Sum of key-value sizes - 3 MB
+  Disk space used        - 637 MB
+
+=====================================================================
+[1] FAULT: qm stop 602 (fdb-node2, 10.131.9.45)   [PVE write]
+=====================================================================
+602 -> stopped
+
+# +20s  fdbcli status (full): coordinator reachability
+Could not communicate with all of the coordination servers.
+  The database will remain operational as long as we
+  can connect to a quorum of servers, however the fault
+  tolerance of the system is reduced as long as the
+  servers remain disconnected.
+  10.131.9.44:4500  (reachable)
+  10.131.9.45:4500  (unreachable)
+  10.131.9.46:4500  (reachable)
+Fetching consistency scan state timed out.
+
+# +20s  status minimal:
+The database is unavailable; type `status' for more information.
+# +65s  re-check status minimal: still unavailable
+
+# status json (parsed) — authoritative recovery state:
+  available = false
+  recovery_state = {
+      "name"        : "recruiting_transaction_servers",
+      "description" : "Recruiting new transaction servers.",
+      "seconds_since_last_recovered" : -1        # NEVER recovered while 602 down
+  }
+  processes (2 of 3):
+    10.131.9.46:4500  roles=[cluster_controller]
+    10.131.9.44:4500  roles=[master, data_distributor, ratekeeper, consistency_scan]
+
+# cross-checks:
+  - status minimal from node 46 (603): also "unavailable"  -> cluster-wide, not a 44-client issue
+  - fdbserver up + LISTENING on 4500 at both 44 (pid 716) and 46 (pid 724)
+
+# FINDING (1-node failure): 3-node triple cluster -> stuck "recruiting_transaction_servers",
+#   available=false, no completed recovery during the >3 min observed (seconds_since_last_recovered
+#   stayed -1). Roles WERE re-elected (46=controller, 44=master) but the transaction-log group
+#   cannot be re-formed at 2/3. NOT the naive "stays available at 2/3". No data loss (data intact
+#   on the 2 surviving copies; verified post-recovery below).
+
+=====================================================================
+[2] RECOVERY: qm start 602   [PVE write]
+=====================================================================
+602 -> running (fdbserver pid 717 on 10.131.9.45)
+
+# +75s  status minimal:
+The database is available.
+# +75s  full status:
+  FoundationDB processes - 3
+  Fault Tolerance        - 0 machines (1 without data loss)
+  Replication health     - Healthy
+  Moving data            - 0.000 GB
+  Sum of key-value sizes - 3 MB
+  Disk space used        - 637 MB
+
+# validate_invariants (data integrity, post-failure + recovery):
+scanned: 16 sessions, 16 sess-idx rows, 64 slots, 0 clients
+I-1/I-2 dirent->inode closure: PASS (65 dirents, no dangling)
+I-4 NL == 2 + dir_children: PASS (2 parents)
+I-5 fileid unique + monotonic: PASS (counter=32770, 66 fids, dup_samples=0)
+I-9 orphans=0, 0x21 dual-write set equal: PASS
+I-3 rename atomicity: SKIPPED (unimplemented, G1/NOSUPPORT)
+I-8 queue claim: SKIPPED (keyspace not in slice)
+I-6 stripe/layout refs: PASS (64 hdrs, 64 layout rows, 128 ds rows, 64 rev rows)
+I-7 protocol state: FAIL (closure=16)
+   0x70 session references missing 0x73 client cid=5000..5015 (16 total)
+== FAIL ==  RC=1
+
+# I-7 attribution — NOT node-failure data loss (evidence = mixed_load_bench.c seed code):
+#   seed does catalogue_fdb_wipe() then session_put() x16 (clientid 5000+i) but NEVER client_put();
+#   so the 16 0x70 sessions reference 0x73 client rows that were never created. I-7 therefore
+#   fails on the bench-seeded keyspace INDEPENDENT of any node failure. This is a pre-existing
+#   C-12 mixed_load_bench seed-completeness gap, surfaced here by running the validator on the
+#   bench keyspace. No data loss: all real invariants (I-1/2/4/5/6/9) PASS and data sizes
+#   3 MB / 637 MB are unchanged pre/post the failure.
+
+=====================================================================
+RESULT
+=====================================================================
+1. 1-of-3 node failure: cluster enters "recruiting_transaction_servers", available=false, and
+   does NOT complete a recovery while the node stays down (>3 min observed, never recovered in
+   that window). A minimal 3-node triple cluster is NOT continuously available at 2/3.
+2. Node restored: cluster recovers to 3/3, available, replication Healthy, data intact
+   (no loss; real invariants all PASS).
+3. Implication (marked interpretation; mechanism = stuck TX-server recruitment at 2/3):
+   production FDB HA needs more nodes / multi-region so the transaction-log group can re-form
+   without the failed node. A 3-node footprint optimizes capacity, not availability-during-failure.
+4. I-7 invariants FAIL is a SEPARATE pre-existing mixed_load_bench seed gap (sessions w/o clients),
+   not a C-5 / data-loss event — to be fixed in the bench seed (follow-up, C-12 side).

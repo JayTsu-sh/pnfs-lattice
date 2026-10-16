@@ -1,0 +1,46 @@
+{
+  "run": "C-5 FDB HA/Recovery fault injection (Phase 4)",
+  "date": "2026-10-16",
+  "commit": "57ba769",
+  "evidence_class": "lab-REAL (real 3-node FDB cluster, real node stop/start via PVE)",
+  "cluster": {
+    "redundancy": "triple",
+    "nodes": 3,
+    "fdb_version": "7.4.8",
+    "client_node": "10.131.9.44 (fdb-node1, VM 601)",
+    "faulted_node": "10.131.9.45 (fdb-node2, VM 602)"
+  },
+  "fault": {
+    "action": "qm stop 602 / qm start 602 (PVE 10.131.9.20)",
+    "degraded_state": {
+      "available": false,
+      "recovery_state": "recruiting_transaction_servers",
+      "seconds_since_last_recovered": -1,
+      "processes": 2,
+      "roles": "10.131.9.46=cluster_controller; 10.131.9.44=master,data_distributor,ratekeeper,consistency_scan",
+      "observed_window_min": ">=3 (never recovered in window)"
+    },
+    "recovered_state": {
+      "available": true,
+      "processes": 3,
+      "fault_tolerance": "1 machine without data loss",
+      "replication": "Healthy",
+      "kv_size": "3 MB",
+      "disk_used": "637 MB"
+    }
+  },
+  "data_integrity": {
+    "no_data_loss": true,
+    "invariants": {
+      "pass": ["I-1", "I-2", "I-4", "I-5", "I-6", "I-9"],
+      "skipped": ["I-3 (unimplemented)", "I-8 (keyspace not in slice)"],
+      "fail": ["I-7 (closure=16) — pre-existing mixed_load_bench seed gap, NOT data loss"]
+    },
+    "kv_size_pre_post": "3 MB / 637 MB unchanged"
+  },
+  "finding": {
+    "ha": "3-node triple cluster losing 1 node -> stuck 'recruiting_transaction_servers', available=false, no completed recovery while node down (>3 min observed). Node restored -> 3/3 available, data intact. A minimal 3-node cluster is NOT continuously available at 2/3; production FDB HA needs more nodes / multi-region.",
+    "i7_note": "I-7 invariants FAIL is a separate pre-existing mixed_load_bench seed-completeness gap (16 sessions seeded without 0x73 client rows), independent of the node failure; follow-up to fix in the bench seed."
+  },
+  "gate_input": "G-GATE-6 D5 reliability input (FDB HA/recovery, was 零实测)"
+}
